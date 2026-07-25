@@ -8,6 +8,10 @@
  *   irm <raw>/install.js | node -                 same, PowerShell
  *   node install.js                               inside a clone, copies local
  *
+ *   Which source is used depends on how the installer was started, not on what
+ *   happens to be in the working directory: piped in, it always fetches. See
+ *   resolveSource(). `--local` and `--remote` override either way.
+ *
  * WHY NODE AND NOT install.sh + install.ps1
  *   Node >= 14.17 is already a hard requirement of the thing being installed,
  *   so a Node installer adds no new runtime and — unlike a shell pair — cannot
@@ -239,16 +243,34 @@ function get(url, redirects = 5) {
 }
 
 /**
+ * True when this script is a real file on disk (`node install.js`), false when
+ * it arrived on stdin (`curl … | node -`). Piped, Node reports `__filename` as
+ * the literal string "[stdin]" and `__dirname` as ".".
+ */
+function ranAsFile() {
+  return path.isAbsolute(__dirname) && fs.existsSync(__filename);
+}
+
+/**
  * Where to read the scripts from.
  *
- * `__dirname` is the clone when run as `node install.js`, and the current
- * working directory when the script arrived on stdin. So "local" means every
- * wanted file is sitting right there — not merely one of them.
+ * Run as a file, `__dirname` is a checkout and copying from it is the whole
+ * point of `node install.js`. Piped, there is no checkout: `__dirname` is only
+ * the caller's working directory, and auto-detecting "local" there would
+ * silently install whatever same-named files happen to be sitting in it —
+ * a stale working tree, or someone else's script entirely. The documented
+ * one-liner means "install the published version", so piped auto-detection
+ * resolves remote and `--local` becomes the explicit opt-in.
+ *
+ * "Local" means every wanted file is present, not merely one of them.
  */
 function resolveSource(opts) {
   if (opts.source === 'remote') return { mode: 'remote', dir: null };
+  if (opts.source === 'auto' && !ranAsFile()) return { mode: 'remote', dir: null };
 
-  const here = __dirname;
+  // path.resolve() so an explicit --local while piped reports a real path
+  // rather than the bare "." Node hands us.
+  const here = path.resolve(__dirname);
   const allPresent = wantedFiles(opts).every((n) => {
     try { return fs.statSync(path.join(here, n)).isFile(); } catch { return false; }
   });

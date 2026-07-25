@@ -624,6 +624,24 @@ check('the piped `node -` form behaves like `node install.js`', () => {
   assert(readJson(dir, 'settings.json').statusLine, 'statusLine key');
 });
 
+check('the piped form never auto-detects the cwd as a source', () => {
+  // The regression: piped in, __dirname is "." -- the caller's working
+  // directory. Auto-detecting a checkout there makes the documented one-liner
+  // install whatever same-named files happen to be lying around instead of the
+  // published version, which is exactly what it must not do. cwd is the repo
+  // root here, so both files ARE present and the old code took the bait.
+  //
+  // This is the one case that reaches for the network. It asserts only on the
+  // source line, which is printed before the first request, so the assertion
+  // holds whether the fetch succeeds, 404s or fails to resolve at all.
+  const r = installer(
+    ['--dir', sandboxPath(), '--dry-run', '--main-only', '--ref', 'no-such-ref-exists'],
+    { viaStdin: true }
+  );
+  assertMatch(r.stdout, 'source      GridFlowTech/claude-statusline@no-such-ref-exists', 'resolved source');
+  assertNotMatch(r.stdout, 'source      .', 'must not resolve the bare cwd');
+});
+
 check('--uninstall removes our keys and files but keeps the ledger', () => {
   const dir = sandbox();
   fs.writeFileSync(path.join(dir, 'settings.json'), JSON.stringify({ model: 'opus' }));

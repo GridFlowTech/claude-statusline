@@ -14,6 +14,8 @@ Subagent Active: cavecrew-reviewer
 
 ![The statusline rendered in a terminal, above the Claude Code prompt](assets/statusline.png)
 
+![The statusline showing Fable 5 with thinking, caveman and ponytail modes active](assets/statusline-fable.png)
+
 Lines run fastest-changing to slowest: context and rate limits move on every
 response, cost moves with them, and branch/working-tree state barely moves
 within a turn — so the repo row sits at the bottom.
@@ -45,7 +47,7 @@ statusline.js             the status line above the footer
 subagent-statusline.js    one row per subagent in the agent panel
 install.js                installer, updater and uninstaller in one file
 examples/                 mock payloads, plus a transcript that proves the dedup
-test/run.js               54 assertions, no framework
+test/run.js               59 assertions, no framework
 test/demo.js              renders every scenario with live timestamps
 ```
 
@@ -54,7 +56,7 @@ throwaway config directory, so neither touches your real ledger or settings:
 
 ```
 node test/demo.js     # every scenario, with live pace arrows
-node test/run.js      # 54 passed, 0 failed
+node test/run.js      # 59 passed, 0 failed
 ```
 
 ---
@@ -118,10 +120,21 @@ cd claude-statusline
 node install.js
 ```
 
-All three run the same `install.js` and produce the same result. Copying the
-two scripts into `$CLAUDE_CONFIG_DIR` (or `~/.claude`), adding `statusLine` and
+All three run the same `install.js`. Copying the two scripts into
+`$CLAUDE_CONFIG_DIR` (or `~/.claude`), adding `statusLine` and
 `subagentStatusLine` to `settings.json`, and backing that file up first are all
 part of the one command — there are no manual steps left.
+
+They differ in one respect, and it is decided by how the installer was started
+rather than by what is in your working directory:
+
+- **Piped** — always downloads the published scripts. It does this even if you
+  happen to be standing in a checkout, because the one-liner means "install the
+  published version", and quietly picking up a stale working tree instead would
+  be a nasty surprise.
+- **`node install.js`** — installs the checkout it lives in.
+
+`--local` and `--remote` override either way.
 
 The bar appears on the next assistant message. No restart.
 
@@ -1132,7 +1145,7 @@ but it does not touch `subagentStatusLine` or delete any files.
 ## Development
 
 ```
-node test/run.js       # 54 assertions across all three scripts
+node test/run.js       # 59 assertions across all three scripts
 node test/demo.js      # render every scenario with live timestamps
 node --check statusline.js && node --check subagent-statusline.js && node --check install.js
 ```
@@ -1157,9 +1170,12 @@ throwaway `--dir`, asserting on what actually lands on disk. They cover the
 unparseable JSON, `--main-only`/`--subagent-only`, the manifest hashes, the
 uninstall, and — for the updater — that an edited file is never overwritten.
 
-**The suite is hermetic and runs offline.** Every installer case passes
+**The suite is offline but for one case.** Every installer case passes
 `--local`, and every updater case is arranged so the updater bails out before
-its first network call. Nothing in `test/run.js` contacts GitHub.
+its first network call. The exception is *the piped form never auto-detects the
+cwd as a source*, which necessarily reaches for the network — it asserts only on
+the source line, printed before the first request, so it passes with or without
+a connection.
 
 Three conventions worth keeping if you send a patch:
 
