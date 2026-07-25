@@ -294,8 +294,13 @@ async function loadFile(name, src, opts) {
  * ------------------------------------------------------------------------ */
 
 function validate(name, content, targetDir) {
-  if (!content || content.length < MIN_BYTES) {
-    die(`${name} came back as ${content ? content.length : 0} bytes — too small to be real. Nothing was written.`);
+  // Byte length, not string length: both scripts are full of multi-byte glyphs
+  // (· ⎇ ↑), so `content.length` counts characters and under-reports the file
+  // by ~30 bytes. Small enough not to matter to the threshold, big enough to
+  // make the number printed next to it wrong.
+  const bytes = content ? Buffer.byteLength(content, 'utf8') : 0;
+  if (bytes < MIN_BYTES) {
+    die(`${name} came back as ${bytes} bytes — too small to be real. Nothing was written.`);
   }
   if (!content.startsWith('#!/usr/bin/env node')) {
     die(`${name} does not start with the expected shebang — refusing to install it. Nothing was written.`);
@@ -395,7 +400,7 @@ async function install(opts) {
   if (!opts.dryRun || fs.existsSync(verifyDir)) {
     for (const name of files) {
       validate(name, loaded[name], verifyDir);
-      say(`${tag}verified ${name}  (${loaded[name].length} bytes, node --check ok)`);
+      say(`${tag}verified ${name}  (${Buffer.byteLength(loaded[name], 'utf8')} bytes, node --check ok)`);
     }
   }
 

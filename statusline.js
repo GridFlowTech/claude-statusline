@@ -1286,7 +1286,7 @@ async function selfUpdate() {
     const url = `https://raw.githubusercontent.com/${repo}/${encodeURIComponent(ref)}/${name}`;
     const next = await updateFetch(https, url, 5);
 
-    if (!next || next.length < UPDATE_MIN_BYTES) continue;
+    if (!next || Buffer.byteLength(next, 'utf8') < UPDATE_MIN_BYTES) continue;
     if (!next.startsWith('#!/usr/bin/env node')) continue;
     const nextHash = sha(next);
     if (nextHash === baseline) continue;             // already current
