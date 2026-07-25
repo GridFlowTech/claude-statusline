@@ -4,13 +4,7 @@ A Node.js statusline for Claude Code. Renders model identity, context runway,
 rate-limit pace, a persistent multi-window cost ledger, and repo and git state
 in four lines. Runs on Windows, macOS and Linux from the same files.
 
-```
-Opus 5 (1M context) XHigh Thinking [FAST] [CAVEMAN:ULTRA] [PONYTAIL:ULTRA]
-Ctx 15% · In 152,000 Out 153,470 · Cache 98% · LngCtx 76% · 5h 90%:20%↑ 02:41:4h · 7d 52%:50%→ 08:06:3d
-S $4.87 · D $24.14 · W $88.02 · M $412.60 · $19.48/hr · API 25%
-my-project · ⎇ main +2 ~1 ?3 ⇡1 ⇣2 · [feature-xyz] · statusline-hardening
-Subagent Active: cavecrew-reviewer
-```
+![Every field rendered at once: model identity with the 1M-context, effort, thinking, fast and plugin tags; context, cache, long-context and both rate-limit windows with pace arrows; the four cost windows with burn rate and API share; repo, branch, working-tree and worktree state; and four agent-panel rows below](assets/statusline-all-fields.png)
 
 ![The statusline rendered in a terminal, above the Claude Code prompt](assets/statusline.png)
 
