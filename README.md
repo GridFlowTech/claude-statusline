@@ -324,8 +324,8 @@ Opus 5 (1M context) XHigh Thinking [FAST] [CAVEMAN:ULTRA] [PONYTAIL:ULTRA]
 | Cell | Source | Notes |
 |---|---|---|
 | Model | `model.display_name` | Bold. Falls back to `Claude`. |
+| `(1M context)` | `context_window.context_window_size == 1000000` | **Suppressed when `display_name` already says `1M`**, so `Opus 5 (1M context)` never doubles up. Placed before effort so a synthesised tag lands where Opus's baked-in one does. |
 | Effort | `effort.level` | Capitalised; `xhigh` renders `XHigh`. Absent on models without an effort parameter. |
-| `(1M context)` | `context_window.context_window_size == 1000000` | **Suppressed when `display_name` already says `1M`**, so `Opus 5 (1M context)` never doubles up. |
 | `Thinking` | `thinking.enabled === true` | |
 | `[FAST]` | `fast_mode === true` | Fast mode changes throughput and therefore rate-limit burn. |
 | `[CAVEMAN:x]` | plugin state | See [Plugin mode detection](#plugin-mode-detection). |

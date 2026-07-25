@@ -865,7 +865,7 @@ function formatEffort(level) {
 }
 
 /**
- * Line 1: Model Effort (context variant) Thinking [FAST] [CAVEMAN:X]
+ * Line 1: Model (context variant) Effort Thinking [FAST] [CAVEMAN:X]
  *         [PONYTAIL:Y] session-name
  *
  * The required elements keep their specified relative order. FAST sits with the
@@ -892,8 +892,8 @@ function lineModel(d, maxWidth) {
 
   return fit([
     cell(bold(modelText), 0),
-    cell(formatEffort(d?.effort?.level) && cyan(formatEffort(d.effort.level)), 3),
     cell(showVariant ? dim('(1M context)') : '', 5),
+    cell(formatEffort(d?.effort?.level) && cyan(formatEffort(d.effort.level)), 3),
     cell(d?.thinking?.enabled === true ? cyan('Thinking') : '', 4),
     cell(fast ? yellow('[FAST]') : '', 3),
     cell(caveman ? orange(`[CAVEMAN:${caveman}]`) : '', 2),
