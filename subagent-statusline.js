@@ -63,8 +63,6 @@ const red = (s) => paint('38;5;203', s);
 const yellow = (s) => paint('38;5;179', s);
 const green = (s) => paint('38;5;108', s);
 const cyan = (s) => paint('38;5;110', s);
-const orange = (s) => paint('38;5;172', s);
-const magenta = (s) => paint('38;5;176', s);
 
 const SEP = dim(' · ');
 
@@ -271,14 +269,18 @@ function renderRow(task, columns, nowMs) {
     cell(detail ? dim(detail) : '', 5),
   ];
 
-  // First pass drops whole cells. If the description alone still overflows,
-  // clip it rather than losing it -- it is the only cell that says what the
-  // teammate is actually doing.
+  // First pass drops whole cells. The detail cell is rank 5, so it is the
+  // first to go under pressure -- but it is the only cell that says what the
+  // teammate is actually doing, so when it did not survive (or the line still
+  // overflows), clip it into whatever room remains rather than losing it.
   let line = fit(cells, SEP, columns);
-  if (columns !== null && visibleWidth(line) > columns && detail) {
-    const withoutDetail = fit(cells.slice(0, -1), SEP, columns);
-    const room = columns - visibleWidth(withoutDetail) - visibleWidth(SEP);
-    line = room > 4 ? withoutDetail + SEP + dim(clip(detail, room)) : withoutDetail;
+  if (columns !== null && detail) {
+    const detailCell = cells[cells.length - 1].text;
+    if (visibleWidth(line) > columns || !line.endsWith(detailCell)) {
+      const withoutDetail = fit(cells.slice(0, -1), SEP, columns);
+      const room = columns - visibleWidth(withoutDetail) - visibleWidth(SEP);
+      line = room > 4 ? withoutDetail + SEP + dim(clip(detail, room)) : withoutDetail;
+    }
   }
 
   return line;
