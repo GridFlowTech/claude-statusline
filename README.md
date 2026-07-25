@@ -14,7 +14,7 @@ Subagent Active: cavecrew-reviewer
 
 ![The statusline rendered in a terminal, above the Claude Code prompt](assets/statusline.png)
 
-![The statusline showing Fable 5 with thinking, caveman and ponytail modes active](assets/statusline-fable.png)
+![The statusline showing Fable 5 with thinking, caveman and ponytail modes active, above the prompt and the agent panel](assets/statusline-fable.png)
 
 Lines run fastest-changing to slowest: context and rate limits move on every
 response, cost moves with them, and branch/working-tree state barely moves
