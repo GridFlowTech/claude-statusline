@@ -320,7 +320,7 @@ check('a hostile session_id cannot become a ledger record', () => {
 
 check('a named agent adds the trailing row', () => {
   const r = run(MAIN, basePayload({ agent: { name: 'cavecrew-reviewer' } }));
-  assertMatch(r.stdout, 'Subagent Active: cavecrew-reviewer', 'agent row');
+  assertMatch(r.stdout, 'Session Agent: cavecrew-reviewer', 'agent row');
 });
 
 check('no blank lines are ever printed', () => {
@@ -344,6 +344,14 @@ check('ASCII mode replaces every non-ASCII glyph', () => {
   for (const glyph of ['\u2191', '\u2192', '\u2193', '\u2387', '\u2713', '\u21e1', '\u21e3']) {
     assertNotMatch(r.stdout, glyph, `glyph ${escape(glyph)} should be suppressed`);
   }
+});
+
+check('CC_STATUSLINE_NOCOLOR=1 alone disables colour', () => {
+  const esc = String.fromCharCode(27);
+  const r = run(MAIN, basePayload({ exceeds_200k_tokens: true }), {
+    env: { NO_COLOR: '', CC_STATUSLINE_NOCOLOR: '1' },
+  });
+  assert(!r.stdout.includes(esc), 'ANSI escapes emitted despite CC_STATUSLINE_NOCOLOR=1');
 });
 
 /* ========================================================================== */
@@ -417,7 +425,9 @@ check('escape sequences in task text are stripped', () => {
     columns: 90,
     tasks: [{ id: 'x', name: `nm${esc}[31m`, status: 'running', description: `d${esc}[5m` }],
   });
-  assert(!r.stdout.includes(esc), 'raw ESC reached stdout');
+  // JSON.stringify escapes control bytes in stdout regardless, so the raw
+  // stream is clean by construction -- the parsed content is what matters.
+  assert(!JSON.parse(r.lines[0]).content.includes(esc), 'ESC survived into the row content');
 });
 
 check('escape sequences in the effort field are stripped', () => {
@@ -426,7 +436,199 @@ check('escape sequences in the effort field are stripped', () => {
     columns: 90,
     tasks: [{ id: 'x', name: 'n', status: 'running', model: 'claude-opus-5', effort: `hi${esc}[31mgh` }],
   });
-  assert(!r.stdout.includes(esc), 'raw ESC reached stdout');
+  assert(!JSON.parse(r.lines[0]).content.includes(esc), 'ESC survived into the row content');
+});
+
+const rowById = (r, id) => r.lines.map((l) => JSON.parse(l)).find((x) => x.id === id);
+
+check('colour mode paints the name by status: running green, completed cyan, failed red', () => {
+  const esc = String.fromCharCode(27);
+  const r = run(SUB, subPayload, { env: { NO_COLOR: '' } });
+  assertMatch(rowById(r, 't1').content, `${esc}[38;5;108m${esc}[1mcavecrew-investigator`, 'running green+bold');
+  assertMatch(rowById(r, 't3').content, `${esc}[38;5;110m${esc}[1mdoc-writer`, 'completed cyan+bold');
+  assertMatch(rowById(r, 't4').content, `${esc}[38;5;203m${esc}[1mflaky`, 'failed red+bold');
+});
+
+check('error and done statuses alias the failed and completed colours', () => {
+  const esc = String.fromCharCode(27);
+  const r = run(SUB, {
+    columns: 90,
+    tasks: [
+      { id: 'er', name: 'er-task', status: 'error' },
+      { id: 'dn', name: 'dn-task', status: 'done' },
+      { id: 'odd', name: 'odd-task', status: 'waiting' },
+    ],
+  }, { env: { NO_COLOR: '' } });
+  assertMatch(rowById(r, 'er').content, `${esc}[38;5;203m${esc}[1mer-task`, 'error renders red');
+  assertMatch(rowById(r, 'dn').content, `${esc}[38;5;110m${esc}[1mdn-task`, 'done renders cyan');
+  assertMatch(rowById(r, 'odd').content, `${esc}[2m${esc}[1modd-task`, 'unknown status renders dim');
+});
+
+check('token percentage thresholds: 70% turns yellow and 90% turns red', () => {
+  const esc = String.fromCharCode(27);
+  const r = run(SUB, {
+    columns: 90,
+    tasks: [
+      { id: 'lo', name: 'lo', status: 'running', tokenCount: 100000, contextWindowSize: 200000 },
+      { id: 'mid', name: 'mid', status: 'running', tokenCount: 140000, contextWindowSize: 200000 },
+      { id: 'hi', name: 'hi', status: 'running', tokenCount: 180000, contextWindowSize: 200000 },
+    ],
+  }, { env: { NO_COLOR: '' } });
+  assertMatch(rowById(r, 'lo').content, `${esc}[38;5;108m50%`, '50% green');
+  assertMatch(rowById(r, 'mid').content, `${esc}[38;5;179m70%`, '70% yellow, not green');
+  assertMatch(rowById(r, 'hi').content, `${esc}[38;5;203m90%`, '90% red, not yellow');
+});
+
+check('colour mode: the width budget counts visible glyphs, not ANSI bytes', () => {
+  const esc = String.fromCharCode(27);
+  const ansiRe = new RegExp(esc + '\\[[0-9;]*m', 'g');
+  const cols = 41;
+  const r = run(SUB, {
+    columns: cols,
+    tasks: [{
+      id: 'x', name: 'agent', status: 'running', model: 'claude-opus-5',
+      tokenCount: 100000, contextWindowSize: 200000, description: 'working on it',
+    }],
+  }, { env: { NO_COLOR: '' } });
+  const { content } = JSON.parse(r.lines[0]);
+  // The visible width is exactly the budget; the raw width is far past it.
+  // Counting ANSI bytes as width would evict every coloured cell below.
+  for (const piece of ['Opus 5', '100k', '50%', 'working on it']) {
+    assertMatch(content, piece, 'a cell was dropped that fits on visible width');
+  }
+  assert(content.length > cols, 'expected ANSI to push the raw length past the budget');
+  assert(content.replace(ansiRe, '').length <= cols, 'visible width exceeds the budget');
+});
+
+check('age renders seconds, minutes and hours, and skew or garbage suppresses it', () => {
+  const now = Date.now();
+  const r = run(SUB, {
+    columns: 120,
+    tasks: [
+      { id: 's', name: 'secs', status: 'running', startTime: now - 42000 },
+      { id: 'm', name: 'mins', status: 'running', startTime: now - 5 * 60000 },
+      { id: 'h', name: 'hrs', status: 'running', startTime: now - (3 * 3600 + 240) * 1000 },
+      { id: 'iso', name: 'iso', status: 'running', startTime: new Date(now - 90000).toISOString() },
+      { id: 'skew', name: 'skew', status: 'running', startTime: now + 60000 },
+      { id: 'old', name: 'old', status: 'running', startTime: now - 8 * 86400000 },
+    ],
+  });
+  assert(/\b4[0-9]s\b/.test(rowById(r, 's').content), `expected an NNs age, got ${rowById(r, 's').content}`);
+  assertMatch(rowById(r, 'm').content, '5m', 'minutes format');
+  assertMatch(rowById(r, 'h').content, '3h4m', 'hours format');
+  assertMatch(rowById(r, 'iso').content, '1m', 'an ISO string startTime is accepted');
+  assert(rowById(r, 'skew').content === 'skew', 'a future startTime must render no age');
+  assert(rowById(r, 'old').content === 'old', 'a >7 day age is garbage and must render no age');
+});
+
+check('token counts render plain, one-decimal k, and M forms', () => {
+  const r = run(SUB, {
+    columns: 90,
+    tasks: [
+      { id: 'a', name: 'aa', status: 'running', tokenCount: 950 },
+      { id: 'b', name: 'bb', status: 'running', tokenCount: 9500 },
+      { id: 'c', name: 'cc', status: 'running', tokenCount: 1200000, contextWindowSize: 1000000 },
+    ],
+  });
+  assertMatch(rowById(r, 'a').content, '950', 'sub-1000 stays a plain integer');
+  assertMatch(rowById(r, 'b').content, '9.5k', 'sub-10k keeps one decimal');
+  assertMatch(rowById(r, 'c').content, '1.2M', 'millions use the M form');
+  assertMatch(rowById(r, 'c').content, '120%', 'an over-budget percentage is not clamped');
+});
+
+check('effort renders the capitalised enum or a token budget; unknown model ids are clipped', () => {
+  const r = run(SUB, {
+    columns: 90,
+    tasks: [
+      { id: 'e1', name: 'e1', status: 'running', model: 'claude-opus-5', effort: 'xhigh' },
+      { id: 'e2', name: 'e2', status: 'running', model: 'claude-opus-5', effort: 'medium' },
+      { id: 'e3', name: 'e3', status: 'running', model: 'claude-opus-5', effort: 31999 },
+      { id: 'e4', name: 'e4', status: 'running', model: 'a-very-long-model-identifier-here' },
+    ],
+  });
+  assertMatch(rowById(r, 'e1').content, 'XHigh', 'xhigh is a special case');
+  assertMatch(rowById(r, 'e2').content, 'Medium', 'plain enums are capitalised');
+  assertMatch(rowById(r, 'e3').content, '32k', 'a numeric effort renders as a token budget');
+  assertMatch(rowById(r, 'e4').content, 'a-very-long-model-..', 'non-claude ids are clipped to 20');
+});
+
+check('missing or nonsensical columns falls back to the default 80 budget', () => {
+  const task = {
+    id: 'x', name: 'agent', status: 'running', model: 'claude-opus-5',
+    tokenCount: 42100, contextWindowSize: 200000, description: 'd'.repeat(200),
+  };
+  for (const columns of [undefined, 5, 'abc']) {
+    const payload = { tasks: [task] };
+    if (columns !== undefined) payload.columns = columns;
+    const r = run(SUB, payload);
+    const { content } = JSON.parse(r.lines[0]);
+    assert(content.length <= 80, `columns=${columns}: row of ${content.length} exceeds the default 80`);
+    assert(content.length > 60, `columns=${columns}: row of ${content.length} suggests a degenerate budget`);
+  }
+});
+
+check('a description that cannot fit whole is clipped with a marker, not dropped', () => {
+  const r = run(SUB, {
+    columns: 40,
+    tasks: [{ id: 'x', name: 'agent', status: 'running', description: 'd'.repeat(120) }],
+  });
+  const { content } = JSON.parse(r.lines[0]);
+  assert(content.length <= 40, `row of ${content.length} exceeds 40`);
+  assertMatch(content, 'ddd', 'some of the description must survive');
+  assertMatch(content, '..', 'the clip marker');
+});
+
+check('cells drop by rank: detail, age, model, then tokens before status on the tie', () => {
+  const task = {
+    id: 'x', name: 'agent', status: 'completed', model: 'claude-opus-5', effort: 'medium',
+    tokenCount: 42100, contextWindowSize: 200000, startTime: Date.now() - 3600000,
+    description: 'the description text',
+  };
+  const render = (columns) => JSON.parse(run(SUB, { columns, tasks: [task] }).lines[0]).content;
+
+  const full = render(90);
+  for (const piece of ['completed', 'Opus 5 Medium', '42k 21%', '1h0m', 'the description text']) {
+    assertMatch(full, piece, 'everything fits at 90');
+  }
+
+  const noAge = render(45);
+  assertNotMatch(noAge, '1h0m', 'age (rank 4) must be gone at 45');
+  assertMatch(noAge, 'Opus 5', 'model (rank 3) must survive at 45');
+
+  const noModel = render(38);
+  assertNotMatch(noModel, 'Opus', 'model must be gone at 38');
+  assertMatch(noModel, '42k', 'tokens must survive at 38');
+  assertMatch(noModel, '..', 'clipped detail must refill the freed space');
+
+  const tie = render(24);
+  assertNotMatch(tie, '42k', 'tokens (rank 2, rightmost) must lose the tie');
+  assertMatch(tie, 'completed', 'status (rank 2, leftmost) must win the tie');
+});
+
+check('SHOW_IDLE_ROWS=false hides idle rows by emitting empty content', () => {
+  const src = fs.readFileSync(SUB, 'utf8');
+  const tunable = 'const SHOW_IDLE_ROWS = true;';
+  assert(src.includes(tunable), 'the tunable moved; update this test');
+  const dir = sandbox();
+  const flipped = path.join(dir, 'subagent-statusline-idle.js');
+  fs.writeFileSync(flipped, src.replace(tunable, 'const SHOW_IDLE_ROWS = false;'));
+
+  const r = run(flipped, subPayload);
+  assert(rowById(r, 't1').content !== '', 'running rows must still render');
+  assert(rowById(r, 't2').content !== '', 'running rows must still render');
+  assert(rowById(r, 't3').content === '', 'a completed row must be hidden via empty content');
+  assert(rowById(r, 't4').content === '', 'a failed row must be hidden via empty content');
+});
+
+check('CC_STATUSLINE_NOCOLOR=1 disables colour in the panel too', () => {
+  // Row content is JSON-stringified, so a raw ESC in stdout is impossible by
+  // construction -- assert on the PARSED content, or this asserts nothing.
+  const esc = String.fromCharCode(27);
+  const r = run(SUB, subPayload, { env: { NO_COLOR: '', CC_STATUSLINE_NOCOLOR: '1' } });
+  assert(r.lines.length === subPayload.tasks.length, 'rows went missing');
+  for (const line of r.lines) {
+    assert(!JSON.parse(line).content.includes(esc), 'ANSI in row content despite CC_STATUSLINE_NOCOLOR=1');
+  }
 });
 
 /* ========================================================================== */

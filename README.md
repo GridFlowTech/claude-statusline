@@ -9,7 +9,7 @@ Opus 5 (1M context) XHigh Thinking [FAST] [CAVEMAN:ULTRA] [PONYTAIL:ULTRA]
 Ctx 15% · In 152,000 Out 153,470 · Cache 98% · LngCtx 76% · 5h 90%:20%↑ 02:41:4h · 7d 52%:50%→ 08:06:3d
 S $4.87 · D $24.14 · W $88.02 · M $412.60 · $19.48/hr · API 25%
 my-project · ⎇ main +2 ~1 ?3 ⇡1 ⇣2 · [feature-xyz] · statusline-hardening
-Subagent Active: cavecrew-reviewer
+Session Agent: cavecrew-reviewer
 ```
 
 ![The statusline rendered in a terminal, above the Claude Code prompt](assets/statusline.png)
@@ -30,7 +30,7 @@ code-reviewer · Haiku 4.5 Medium · 181k 91% · 9s · Review the diff on branch
 | | |
 |---|---|
 | Install | One piped command — see [Installation](#installation) |
-| Scripts | `~/.claude/statusline.js` (1335 lines) · `~/.claude/subagent-statusline.js` (325 lines) |
+| Scripts | `~/.claude/statusline.js` (1393 lines) · `~/.claude/subagent-statusline.js` (336 lines) |
 | Ledger | `~/.claude/cost_ledger.json` (created on first run) |
 | Config | `statusLine` and `subagentStatusLine` blocks in `~/.claude/settings.json` |
 | Runtime | Node.js ≥ 14.17 — built-ins only (`fs`, `path`, `os`, `child_process`; `https`/`crypto` lazily, in the optional updater). No dependencies. |
@@ -47,7 +47,7 @@ statusline.js             the status line above the footer
 subagent-statusline.js    one row per subagent in the agent panel
 install.js                installer, updater and uninstaller in one file
 examples/                 mock payloads, plus a transcript that proves the dedup
-test/run.js               59 assertions, no framework
+test/run.js               72 assertions, no framework
 test/demo.js              renders every scenario with live timestamps
 ```
 
@@ -56,7 +56,7 @@ throwaway config directory, so neither touches your real ledger or settings:
 
 ```
 node test/demo.js     # every scenario, with live pace arrows
-node test/run.js      # 59 passed, 0 failed
+node test/run.js      # 72 passed, 0 failed
 ```
 
 ---
@@ -394,7 +394,7 @@ line is dropped rather than printed blank.
 ### Line 5 — named agent (conditional)
 
 ```
-Subagent Active: cavecrew-reviewer
+Session Agent: cavecrew-reviewer
 ```
 
 Rendered only when `agent.name` is present.
@@ -1061,9 +1061,9 @@ flaky · failed · unknown-model-id · Broken task
 | Age | `startTime` | Accepts epoch ms or an ISO string. Suppressed on clock skew. |
 | Detail | `label`, else `description` | The live status line if there is one, otherwise the original task text. |
 
-Cells drop by rank exactly as in the main script, and if the detail alone still
-overflows it is clipped rather than dropped — it is the only cell that says what
-the teammate is actually doing.
+Cells drop by rank exactly as in the main script — except the detail cell: when
+it cannot fit whole, it is clipped into whatever room remains rather than
+dropped — it is the only cell that says what the teammate is actually doing.
 
 Set `SHOW_IDLE_ROWS = false` at the top of the file to hide everything that is
 not actively running.
@@ -1145,7 +1145,7 @@ but it does not touch `subagentStatusLine` or delete any files.
 ## Development
 
 ```
-node test/run.js       # 59 assertions across all three scripts
+node test/run.js       # 72 assertions across all three scripts
 node test/demo.js      # render every scenario with live timestamps
 node --check statusline.js && node --check subagent-statusline.js && node --check install.js
 ```

@@ -1361,7 +1361,7 @@ function main() {
   if (typeof agentName === 'string' && agentName.trim()) {
     const clean = cleanText(agentName);
     if (clean) {
-      const label = dim('Subagent Active:');
+      const label = dim('Session Agent:');
       // Reserve room for the label + its trailing space when clipping.
       const room = width === null ? 64 : Math.max(8, width - visibleWidth(label) - 1);
       lines.push(`${label} ${cyan(clip(clean, room))}`);
