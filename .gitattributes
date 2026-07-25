@@ -11,3 +11,8 @@
 *.jsonl text eol=lf
 *.md    text eol=lf
 LICENSE text eol=lf
+
+# Screenshots. `text=auto` above already detects these as binary, but say so
+# explicitly: a misdetected image would be silently corrupted by eol rewriting,
+# and nothing in the test suite would notice.
+*.png   binary
