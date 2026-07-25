@@ -6,7 +6,8 @@ cost_ledger.json
 *.bak-*
 settings.json
 
-# Editors / OS
+# Editors / OS / tooling
+.serena/
 .vscode/
 .idea/
 .DS_Store

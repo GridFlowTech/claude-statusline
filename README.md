@@ -12,6 +12,8 @@ my-project · ⎇ main +2 ~1 ?3 ⇡1 ⇣2 · [feature-xyz] · statusline-hardeni
 Subagent Active: cavecrew-reviewer
 ```
 
+![The statusline rendered in a terminal, above the Claude Code prompt](assets/statusline.png)
+
 Lines run fastest-changing to slowest: context and rate limits move on every
 response, cost moves with them, and branch/working-tree state barely moves
 within a turn — so the repo row sits at the bottom.
@@ -25,10 +27,11 @@ code-reviewer · Haiku 4.5 Medium · 181k 91% · 9s · Review the diff on branch
 
 | | |
 |---|---|
-| Scripts | `~/.claude/statusline.js` (1175 lines) · `~/.claude/subagent-statusline.js` (325 lines) |
+| Install | One piped command — see [Installation](#installation) |
+| Scripts | `~/.claude/statusline.js` (1335 lines) · `~/.claude/subagent-statusline.js` (325 lines) |
 | Ledger | `~/.claude/cost_ledger.json` (created on first run) |
 | Config | `statusLine` and `subagentStatusLine` blocks in `~/.claude/settings.json` |
-| Runtime | Node.js ≥ 14.17 — built-ins only (`fs`, `path`, `os`, `child_process`). No dependencies. |
+| Runtime | Node.js ≥ 14.17 — built-ins only (`fs`, `path`, `os`, `child_process`; `https`/`crypto` lazily, in the optional updater). No dependencies. |
 | Platforms | Windows, macOS, Linux |
 | Cost | ~147 ms per render inside a git repo, ~63 ms outside one. ~66 ms for the subagent panel. No API tokens. |
 | Licence | MIT |
@@ -40,8 +43,9 @@ code-reviewer · Haiku 4.5 Medium · 181k 91% · 9s · Review the diff on branch
 ```
 statusline.js             the status line above the footer
 subagent-statusline.js    one row per subagent in the agent panel
+install.js                installer, updater and uninstaller in one file
 examples/                 mock payloads, plus a transcript that proves the dedup
-test/run.js               30 assertions, no framework
+test/run.js               54 assertions, no framework
 test/demo.js              renders every scenario with live timestamps
 ```
 
@@ -50,21 +54,25 @@ throwaway config directory, so neither touches your real ledger or settings:
 
 ```
 node test/demo.js     # every scenario, with live pace arrows
-node test/run.js      # 30 passed, 0 failed
+node test/run.js      # 54 passed, 0 failed
 ```
 
 ---
 
 ## Platform support
 
-Both scripts are plain Node with no native modules, no shell invocation, and no
-platform-specific file layout. The entire platform-conditional surface is three
-lines:
+All three files are plain Node with no native modules, no shell invocation, and
+no platform-specific file layout. The entire platform-conditional surface is
+these two lines:
 
 | Location | What it does elsewhere |
 |---|---|
 | `process.platform === 'win32'` guard around `%APPDATA%` | Skipped; plugin config resolves via `$XDG_CONFIG_HOME` then `~/.config/<plugin>/`, which is where the plugins put it on macOS and Linux |
-| `windowsHide: true` on two spawns | Ignored by POSIX |
+| `windowsHide: true` on the spawns | Ignored by POSIX |
+
+The installer is the same story: `node -` reads a script from stdin identically
+in bash, zsh and PowerShell, which is the whole reason it is one file and not a
+`.sh`/`.ps1` pair.
 
 Everything else — `os.homedir()`, `path.join`, the `git` lookup, atomic rename,
 detached background spawn, the transcript byte offsets — behaves identically.
@@ -87,46 +95,118 @@ Two honest caveats:
 
 ## Installation
 
-**No install script is needed, and none is provided.** Installing is two files
-in a directory plus one key in a JSON file, done once. A script would add a
-thing to trust, a thing to keep in sync with the README, and a new way for the
-install to fail — to save a single edit.
+One command. Node ≥ 14.17 is the only prerequisite, and it is one you already
+have if the statusline is going to run at all.
 
-### 1. Requirements
+**macOS · Linux · WSL · Git Bash**
 
 ```
-node --version      # must be v14.17 or newer
+curl -fsSL https://raw.githubusercontent.com/GridFlowTech/claude-statusline/main/install.js | node -
 ```
 
-Node must be on the `PATH` that Claude Code inherits. If `node` resolves in your
-shell it will resolve for the statusline.
-
-### 2. Place the files
-
-Copy `statusline.js` and `subagent-statusline.js` into your Claude config
-directory — `~/.claude/` on every platform, or `$CLAUDE_CONFIG_DIR` if you have
-relocated it:
+**Windows PowerShell**
 
 ```
-git clone https://github.com/YOUR-USER/claude-statusline
+irm https://raw.githubusercontent.com/GridFlowTech/claude-statusline/main/install.js | node -
+```
+
+**From a clone**
+
+```
+git clone https://github.com/GridFlowTech/claude-statusline
 cd claude-statusline
-node -e "const fs=require('fs'),path=require('path'),os=require('os');const dir=process.env.CLAUDE_CONFIG_DIR||path.join(os.homedir(),'.claude');fs.mkdirSync(dir,{recursive:true});for(const n of ['statusline.js','subagent-statusline.js']){fs.copyFileSync(n,path.join(dir,n));console.log('copied',n,'->',path.join(dir,n))}"
+node install.js
 ```
 
-Then confirm they parse:
+All three run the same `install.js` and produce the same result. Copying the
+two scripts into `$CLAUDE_CONFIG_DIR` (or `~/.claude`), adding `statusLine` and
+`subagentStatusLine` to `settings.json`, and backing that file up first are all
+part of the one command — there are no manual steps left.
+
+The bar appears on the next assistant message. No restart.
+
+### Why one Node file and not `install.sh` + `install.ps1`
+
+`node -` reads a script from stdin, so the same file is both the piped one-liner
+and the local installer, in every shell, on every platform. A shell pair would
+be two implementations of one contract that drift the moment only one of them
+gets a fix. And the runtime is free: Node is already a hard requirement.
+
+### Options
 
 ```
-node --check ~/.claude/statusline.js
-node --check ~/.claude/subagent-statusline.js
+--dry-run           print every action, change nothing
+--auto-update       check GitHub for a newer statusline once a day (off by default)
+--no-auto-update    turn a previously enabled auto-update back off
+--main-only         install the status line, not the subagent panel
+--subagent-only     install the subagent panel, not the status line
+--interval <sec>    statusLine refreshInterval (default 30)
+--ref <branch|tag>  install from a specific ref (default main)
+--dir <path>        target config dir (default $CLAUDE_CONFIG_DIR or ~/.claude)
+--local | --remote  force copying from this checkout, or downloading
+--uninstall         remove the settings keys and the installed scripts
+--purge             with --uninstall, also delete cost_ledger.json
+--help              the list above
 ```
 
-No `chmod` is needed: the scripts are invoked as `node <path>`, not executed
-directly, so the shebang and executable bit are never used.
+Flags pass through the pipe. Read before you run:
 
-### 3. Register them in `settings.json`
+```
+curl -fsSL https://raw.githubusercontent.com/GridFlowTech/claude-statusline/main/install.js | node - --dry-run
+```
 
-Add these two keys to `~/.claude/settings.json`. `~` is expanded by Claude Code
-on every platform, including Windows:
+The two halves are independent — `--main-only` and `--subagent-only` install
+either without the other. See
+[Subagent status lines](#subagent-status-lines-a-separate-feature).
+
+### What it writes
+
+| Path | What |
+|---|---|
+| `<config>/statusline.js` | the status line, written by atomic rename |
+| `<config>/subagent-statusline.js` | the subagent panel, same |
+| `<config>/settings.json` | `statusLine` + `subagentStatusLine` keys; every other key preserved |
+| `<config>/settings.json.bak` | copy of your settings taken before the write |
+| `<config>/.statusline-manifest.json` | sha256 of what was installed, for the update edit-check |
+| `<config>/.statusline-autoupdate` | flag file, only with `--auto-update` |
+
+`<config>` is `$CLAUDE_CONFIG_DIR` if set, else `~/.claude`. Nothing outside it
+is ever touched, and `cost_ledger.json` is never written or deleted by the
+installer.
+
+Nothing is installed until **every** file has been fetched *and* has passed
+`node --check`. A truncated transfer, a captive-portal login page or a 404 body
+fails the run before the first byte is written. The `node --check` gate is the
+one that matters: it parses each file exactly as Node will at render time.
+
+If `settings.json` is not valid JSON, the installer refuses to touch it and
+prints the two keys to add by hand. Overwriting a settings file it could not
+parse would destroy your hooks, permissions and MCP servers.
+
+### Windows path caveat
+
+The installer handles this; it is documented because it explains the shape of
+what lands in `settings.json`, and it still applies if you hand-edit.
+
+On Windows, Claude Code routes statusline commands **through Git Bash when Git
+Bash is installed**, and through PowerShell only when it is absent.
+
+- **Forward slashes** (`C:/Users/you/.claude/statusline.js`) or `~`. Git Bash
+  treats unquoted backslashes as escape characters, so a path written
+  `C:\Users\you\.claude\statusline.js` arrives with its separators stripped and
+  the command fails with no visible error — the bar just goes blank. The
+  installer always writes forward slashes.
+- **Never `%USERPROFILE%`.** cmd-style variables are not expanded by Git Bash.
+  On macOS and Linux, `$HOME` has the same problem in reverse; `~` works
+  everywhere.
+
+No `chmod` is needed on any platform: the scripts are invoked as `node <path>`,
+not executed directly, so the shebang and the executable bit are never used.
+
+### By hand
+
+Still two files and one key, if you would rather. Copy `statusline.js` and
+`subagent-statusline.js` into `~/.claude/`, then add:
 
 ```json
 {
@@ -142,34 +222,50 @@ on every platform, including Windows:
 }
 ```
 
-The two are independent — install either without the other. See
-[Subagent status lines](#subagent-status-lines-a-separate-feature).
+`~` is expanded by Claude Code on every platform, including Windows. A manual
+install has no manifest, so [auto-update](#auto-update) stays off for it.
 
-If you would rather not hand-edit JSON, this command does exactly the same
-thing. It backs the file up first, preserves every other key, and writes
-absolute paths. It is byte-identical in bash, zsh and PowerShell — verified in
-bash and PowerShell:
+---
+
+## Auto-update
+
+**Off by default.** Turn it on at install time:
 
 ```
-node -e "const fs=require('fs'),path=require('path'),os=require('os');const dir=process.env.CLAUDE_CONFIG_DIR||path.join(os.homedir(),'.claude');const file=path.join(dir,'settings.json');let cfg={};try{cfg=JSON.parse(fs.readFileSync(file,'utf8'));fs.copyFileSync(file,file+'.bak')}catch{}const p=n=>JSON.stringify(path.join(dir,n).split(path.sep).join('/'));cfg.statusLine={type:'command',command:'node '+p('statusline.js'),refreshInterval:30};cfg.subagentStatusLine={type:'command',command:'node '+p('subagent-statusline.js')};fs.writeFileSync(file,JSON.stringify(cfg,null,2));console.log('installed ->',file)"
+curl -fsSL https://raw.githubusercontent.com/GridFlowTech/claude-statusline/main/install.js | node - --auto-update
 ```
 
-It uses only single quotes internally and contains no `$` or backticks, which is
-why one form survives both shells.
+Off by default because the honest description of the feature is *this machine
+runs code downloaded from GitHub on a schedule, without asking*. That is a
+reasonable trade for a statusline you want to keep current, and a bad default to
+impose on someone who did not ask for it. `--no-auto-update` turns it back off;
+so does deleting `~/.claude/.statusline-autoupdate`.
 
-### Windows path caveat
+When it is off, the whole feature costs one `statSync` per render.
 
-Only relevant if you write the path by hand. On Windows, Claude Code routes
-statusline commands **through Git Bash when Git Bash is installed**, and through
-PowerShell only when it is absent.
+When it is on, the render path still does no network I/O. It checks the age of a
+marker file and, at most once a day, spawns a **detached** child that outlives
+the render — the bar is already printed by the time the child does anything. The
+child then refuses to install anything that is not, in order:
 
-- **Use forward slashes** (`C:/Users/you/.claude/statusline.js`) or `~`. Git
-  Bash treats unquoted backslashes as escape characters, so a path written
-  `C:\Users\you\.claude\statusline.js` arrives with its separators stripped and
-  the command fails with no visible error — the bar just goes blank.
-- **Do not use `%USERPROFILE%`.** cmd-style variables are not expanded by Git
-  Bash. On macOS and Linux, `$HOME` has the same problem in reverse; `~` works
-  everywhere.
+1. listed in the manifest written at install time,
+2. byte-identical to what that install put on disk,
+3. over 4 KB and starting with the expected shebang,
+4. parseable by `node --check`.
+
+Only then does it rename the new file into place, atomically.
+
+Step 2 is the one worth knowing about: **if you have edited your copy, the
+updater leaves it alone, permanently.** The tunables at the top of
+`statusline.js` are meant to be edited, and an updater that silently reverted
+them would be a bug. To get back on the update track after editing, re-run the
+installer.
+
+`--ref v1.2` pins an install to a tag, and the updater follows that same ref
+rather than jumping to `main`.
+
+To update once, by hand, without ever enabling the daily check — re-run the
+installer. It is the same command as a fresh install.
 
 ### `refreshInterval`
 
@@ -1008,17 +1104,25 @@ The same trust and `disableAllHooks` gates that apply to `statusLine` apply to
 
 ## Uninstall
 
-Delete the `statusLine` and `subagentStatusLine` keys from
-`~/.claude/settings.json`, then delete the three files. Same command in every
-shell:
+Same one-liner, one flag:
 
 ```
-node -e "const fs=require('fs'),path=require('path'),os=require('os');const dir=process.env.CLAUDE_CONFIG_DIR||path.join(os.homedir(),'.claude');const file=path.join(dir,'settings.json');const cfg=JSON.parse(fs.readFileSync(file,'utf8'));fs.copyFileSync(file,file+'.bak');delete cfg.statusLine;delete cfg.subagentStatusLine;fs.writeFileSync(file,JSON.stringify(cfg,null,2));for(const n of ['statusline.js','subagent-statusline.js','cost_ledger.json']){try{fs.unlinkSync(path.join(dir,n));console.log('removed',n)}catch{}}console.log('unregistered ->',file)"
+curl -fsSL https://raw.githubusercontent.com/GridFlowTech/claude-statusline/main/install.js | node - --uninstall
 ```
 
-Drop a filename from that list to keep it. To remove only the subagent half,
-delete just the `subagentStatusLine` key and `subagent-statusline.js` — the two
-features are independent.
+```
+irm https://raw.githubusercontent.com/GridFlowTech/claude-statusline/main/install.js | node - --uninstall
+```
+
+It removes both settings keys, both scripts and the two marker files, backing
+`settings.json` up first and leaving every other key alone.
+
+**`cost_ledger.json` is kept.** It is your cost history, not part of the
+install, and a reinstall picks up exactly where you left off. Add `--purge` to
+delete it too — that is not reversible.
+
+`--main-only` and `--subagent-only` work here as well, if you want to remove one
+half and keep the other.
 
 Inside Claude Code, `/statusline delete` removes the `statusLine` key for you,
 but it does not touch `subagentStatusLine` or delete any files.
@@ -1028,16 +1132,36 @@ but it does not touch `subagentStatusLine` or delete any files.
 ## Development
 
 ```
-node test/run.js       # 30 assertions across both scripts
+node test/run.js       # 54 assertions across all three scripts
 node test/demo.js      # render every scenario with live timestamps
-node --check statusline.js && node --check subagent-statusline.js
+node --check statusline.js && node --check subagent-statusline.js && node --check install.js
+```
+
+To exercise the installer without touching your real config, point it somewhere
+disposable — `--dir` overrides `$CLAUDE_CONFIG_DIR`, and `--local` makes it
+install the working tree instead of `main`:
+
+```
+node install.js --dir /tmp/cfg --local --dry-run
+node install.js --dir /tmp/cfg --local
+node install.js --dir /tmp/cfg --uninstall
 ```
 
 Each test spawns the real script with a real stdin payload, because that is the
 only interface Claude Code uses. Every run gets a throwaway `CLAUDE_CONFIG_DIR`,
 so the suite never reads your plugin flag files or writes your cost ledger.
 
-Two conventions worth keeping if you send a patch:
+The installer cases work the same way: a real `install.js` process against a
+throwaway `--dir`, asserting on what actually lands on disk. They cover the
+`node -` piped form, key preservation, the settings backup, the abort on
+unparseable JSON, `--main-only`/`--subagent-only`, the manifest hashes, the
+uninstall, and — for the updater — that an edited file is never overwritten.
+
+**The suite is hermetic and runs offline.** Every installer case passes
+`--local`, and every updater case is arranged so the updater bails out before
+its first network call. Nothing in `test/run.js` contacts GitHub.
+
+Three conventions worth keeping if you send a patch:
 
 **No raw control bytes in source.** Every ANSI and control character is written
 as a `\u001b`-style escape. Raw bytes are silently mangled by copy/paste, by
@@ -1046,6 +1170,11 @@ editors, and by `core.autocrlf`, and the damage is invisible until it isn't.
 **Everything stays synchronous and dependency-free.** The scripts run against a
 300 ms debounce; a `require` outside Node's built-ins adds a module resolution
 walk to every single render.
+
+**The render path stays offline.** `https` and `crypto` are required lazily,
+inside the detached updater child. Requiring them at the top of `statusline.js`
+would put that cost on every render, including the renders of everyone who never
+turned auto-update on.
 
 ---
 

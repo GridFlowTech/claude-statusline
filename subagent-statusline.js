@@ -84,9 +84,11 @@ function sleepSync(ms) {
 /** Synchronous stdin read that survives non-blocking pipes on Windows. */
 function readStdin() {
   const CHUNK = 65536;
+  const MAX_STDIN_BYTES = 8 * 1024 * 1024;   // a parent that streams forever must not OOM us
   const buf = Buffer.alloc(CHUNK);
   const parts = [];
   const deadline = Date.now() + 500;
+  let total = 0;
 
   for (;;) {
     let bytes;
@@ -100,7 +102,9 @@ function readStdin() {
       break;
     }
     if (!bytes) break;
+    total += bytes;
     parts.push(Buffer.from(buf.subarray(0, bytes)));
+    if (total >= MAX_STDIN_BYTES) break;
   }
 
   return Buffer.concat(parts).toString('utf8');
@@ -126,7 +130,7 @@ const ANSI_RE = /\u001b\[[0-9;]*m/g;
 const visibleWidth = (s) => String(s).replace(ANSI_RE, '').length;
 
 /** Strip control bytes: task text is model-authored and lands in a terminal. */
-const CONTROL_RE = /[\u0000-\u001f\u007f]/g;
+const CONTROL_RE = /[\x00-\x1f\x7f-\x9f]/g;
 const clean = (s) => (typeof s === 'string' ? s.replace(CONTROL_RE, '').trim() : '');
 
 function clip(s, max) {
@@ -168,7 +172,12 @@ function friendlyModel(id) {
 function friendlyEffort(effort) {
   if (typeof effort === 'string' && effort.trim()) {
     const e = effort.trim().toLowerCase();
-    return { xhigh: 'XHigh', max: 'Max' }[e] || e.charAt(0).toUpperCase() + e.slice(1);
+    // Whitelist: this is an enum-shaped field headed for a terminal. A numeric
+    // string falls through to the token-budget branch below; anything else
+    // renders as nothing at all.
+    if (/^[a-z][a-z0-9-]{0,15}$/.test(e)) {
+      return { xhigh: 'XHigh', max: 'Max' }[e] || e.charAt(0).toUpperCase() + e.slice(1);
+    }
   }
   const n = num(effort);
   return n === null ? '' : compactTokens(n);

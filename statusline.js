@@ -8,8 +8,10 @@
  *   /compact, permission-mode change and vim-mode toggle, debounced at 300ms.
  *   `powershell.exe` costs ~600-900ms of boot before a single byte is printed,
  *   which makes the bar visibly stutter. `node` cold-starts in ~35-50ms and we
- *   only ever require() built-ins (fs / path / os) -- no module resolution walk,
- *   no child processes, no network. One synchronous stdout write at the end.
+ *   only ever require() built-ins (fs / path / os) -- no module resolution walk
+ *   and no network on the render path. One synchronous stdout write at the end.
+ *   `https` and `crypto` are required lazily, inside the detached self-update
+ *   child only, so a normal render never pays for loading them.
  *
  * CONTRACT
  *   stdin  : one JSON object (schema: https://code.claude.com/docs/en/statusline)
@@ -39,6 +41,12 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
+// Windows resolves a bare executable name against the CHILD's cwd before PATH,
+// so a hostile repo could ship its own git.exe and have it spawned on every
+// render. This env var (honoured by CreateProcess, and by libuv on Node 18+)
+// removes cwd from that search. Meaningless elsewhere, so set unconditionally.
+if (process.platform === 'win32') process.env.NoDefaultCurrentDirectoryInExePath = '1';
+
 /* ---------------------------------------------------------------------------
  * Tunables. Edit these; everything below reads from here.
  * ------------------------------------------------------------------------ */
@@ -55,6 +63,12 @@ const ASCII_ARROWS = process.env.CC_STATUSLINE_ASCII === '1';
 // Sessions older than this drop out of the ledger so the file stays small and
 // the monthly roll-up stays fast. 45d covers "current month" from any day.
 const LEDGER_RETENTION_DAYS = 45;
+
+// Hard cap on transcript bytes parsed in a single render. A first render
+// against a pathologically large transcript would otherwise block the bar and
+// balloon memory. Skipping ahead undercounts tokens once, on files that
+// should not exist in practice.
+const TRANSCRIPT_MAX_READ_BYTES = 32 * 1024 * 1024;
 
 // Rate-limit window lengths, in seconds. Fixed by the product, not by payload.
 const FIVE_HOUR_SECONDS = 18000;   // 5 * 3600
@@ -136,9 +150,11 @@ function sleepSync(ms) {
  */
 function readStdin() {
   const CHUNK = 65536;
+  const MAX_STDIN_BYTES = 8 * 1024 * 1024;   // a parent that streams forever must not OOM us
   const buf = Buffer.alloc(CHUNK);
   const parts = [];
   const deadline = Date.now() + 500;
+  let total = 0;
 
   for (;;) {
     let bytes;
@@ -154,7 +170,9 @@ function readStdin() {
       break;
     }
     if (!bytes) break;
+    total += bytes;
     parts.push(Buffer.from(buf.subarray(0, bytes)));
+    if (total >= MAX_STDIN_BYTES) break;
   }
 
   return Buffer.concat(parts).toString('utf8');
@@ -193,6 +211,12 @@ function pctColor(p) {
   if (p >= 70) return yellow;
   return green;
 }
+
+/** Strip C0 AND C1 control bytes. Payload text lands in a terminal on every
+ *  keystroke, and a stray ESC -- or an 8-bit CSI (U+009B), which some
+ *  terminals honour just the same -- would let it inject escape sequences. */
+const CONTROL_RE = /[\x00-\x1f\x7f-\x9f]/g;
+const cleanText = (s) => (typeof s === 'string' ? s.replace(CONTROL_RE, '').trim() : '');
 
 /** Honors CLAUDE_CONFIG_DIR the same way Claude Code and both plugins do. */
 function claudeDir() {
@@ -433,7 +457,9 @@ function gitStatus(cwd) {
 function maybeBackgroundFetch(repoRoot, branch, nowSeconds) {
   try {
     const localDir = path.join(repoRoot, 'local');
-    if (!fs.statSync(localDir, { throwIfNoEntry: false })?.isDirectory()) return;
+    // lstat, not stat: a repo that ships `local` as a symlink or junction must
+    // not trick this into writing the lock file somewhere outside the repo.
+    if (!fs.lstatSync(localDir, { throwIfNoEntry: false })?.isDirectory()) return;
 
     const lockPath = path.join(localDir, '.fetch-lock');
 
@@ -547,6 +573,10 @@ function accumulateTranscript(rec, transcriptPath) {
     rec.tCr = 0;
   }
 
+  if (size - rec.tOff > TRANSCRIPT_MAX_READ_BYTES) {
+    rec.tOff = size - TRANSCRIPT_MAX_READ_BYTES;   // partial first line is skipped by the parser
+  }
+
   if (size > rec.tOff) {
     let chunk = '';
     try {
@@ -646,6 +676,13 @@ function saveLedger(file, data) {
  * @returns {{session:number, day:number, week:number, month:number}}
  */
 function updateLedger(sessionId, sessionCost, transcriptPath) {
+  // The id becomes a plain-object key. Refuse anything that could collide with
+  // Object.prototype ("__proto__", "constructor") or smuggle odd characters --
+  // a hostile id degrades to "count the cost, skip the ledger record".
+  if (typeof sessionId !== 'string' || !/^[\w.-]{1,128}$/.test(sessionId) ||
+      sessionId === '__proto__' || sessionId === 'constructor') {
+    sessionId = '';
+  }
   const cost = num(sessionCost) ?? 0;
   const totals = { session: cost, day: cost, week: cost, month: cost, tokens: null };
 
@@ -658,7 +695,11 @@ function updateLedger(sessionId, sessionCost, transcriptPath) {
 
   // --- record / update the current session -------------------------------
   if (sessionId) {
-    let rec = store.sessions[sessionId];
+    // Own-property lookup only: a key like "toString" must never hand back
+    // something inherited from Object.prototype as if it were a record.
+    let rec = Object.prototype.hasOwnProperty.call(store.sessions, sessionId)
+      ? store.sessions[sessionId]
+      : undefined;
     if (!rec || typeof rec !== 'object') {
       rec = store.sessions[sessionId] = { first: now, last: now, cost };
       dirty = true;
@@ -814,8 +855,11 @@ function untilReset(resetsAt, nowSeconds) {
 
 /** xhigh -> "XHigh"; anything else -> first letter capitalised. */
 function formatEffort(level) {
-  if (typeof level !== 'string' || !level.trim()) return '';
+  if (typeof level !== 'string') return '';
   const l = level.trim().toLowerCase();
+  // Whitelist, not a strip: this is an enum-shaped field headed for a
+  // terminal, so anything outside plain words renders as nothing at all.
+  if (!/^[a-z][a-z0-9-]{0,15}$/.test(l)) return '';
   const special = { xhigh: 'XHigh', max: 'Max' };
   return special[l] || l.charAt(0).toUpperCase() + l.slice(1);
 }
@@ -830,7 +874,7 @@ function formatEffort(level) {
  */
 function lineModel(d, maxWidth) {
   const model = d?.model?.display_name;
-  const modelText = typeof model === 'string' && model.trim() ? model.trim() : 'Claude';
+  const modelText = cleanText(model) || 'Claude';
 
   // Only annotate the extended window, and only when the display name hasn't
   // already said so -- "Opus 5 (1M context)" must not become "... (1M context)
@@ -874,7 +918,7 @@ function lineRepo(d, nowSeconds, maxWidth) {
   // nothing here. It is absent outside a repo or when there is no origin --
   // fall back to the project directory's own name.
   const dir = d?.workspace?.project_dir || d?.workspace?.current_dir || d?.cwd || '';
-  const repoName = d?.workspace?.repo?.name || (dir ? path.basename(dir) : '');
+  const repoName = cleanText(d?.workspace?.repo?.name) || (dir ? cleanText(path.basename(dir)) : '');
 
   let gitText = '';
   const cwd = d?.workspace?.current_dir || d?.cwd || dir;
@@ -912,7 +956,7 @@ function lineRepo(d, nowSeconds, maxWidth) {
   const rawName = d?.session_name;
   const sessionName =
     typeof rawName === 'string' && rawName.trim()
-      ? rawName.trim().replace(/[\u0000-\u001f\u007f]/g, '')
+      ? cleanText(rawName)
       : '';
 
   // workspace.git_worktree is present for ANY linked worktree created with
@@ -923,7 +967,7 @@ function lineRepo(d, nowSeconds, maxWidth) {
   const rawTree = d?.workspace?.git_worktree;
   const worktree =
     typeof rawTree === 'string' && rawTree.trim()
-      ? rawTree.trim().replace(/[\u0000-\u001f\u007f]/g, '')
+      ? cleanText(rawTree)
       : '';
 
   return fit([
@@ -1107,6 +1151,171 @@ function lineUsage(d, ledger, nowSeconds, maxWidth) {
 }
 
 /* ---------------------------------------------------------------------------
+ * Optional self-update
+ * ----------------------------------------------------------------------------
+ * OFF unless <config>/.statusline-autoupdate exists. `install.js --auto-update`
+ * creates it; `install.js --no-auto-update` removes it. When it is absent the
+ * entire feature costs one statSync per render.
+ *
+ * When it is present the render path still does no network I/O. It checks the
+ * age of a marker file and, at most once a day, spawns a DETACHED child that
+ * exits on its own schedule -- the bar is already printed by then.
+ *
+ * The child refuses to install anything that is not, in order:
+ *   1. present in the manifest written at install time,
+ *   2. byte-identical to what that install put on disk (else you edited it --
+ *      the tunables at the top of this file are meant to be edited, and an
+ *      updater that silently reverts them would be a bug, not a feature),
+ *   3. over 4 KB and starting with the expected shebang,
+ *   4. parseable by `node --check`.
+ * Only then does it rename the new file into place.
+ * ------------------------------------------------------------------------ */
+
+const UPDATE_REPO = 'GridFlowTech/claude-statusline';
+const UPDATE_FILES = ['statusline.js', 'subagent-statusline.js'];
+const UPDATE_FLAG_FILE = '.statusline-autoupdate';
+const UPDATE_MARKER_FILE = '.statusline-last-update';
+const UPDATE_MANIFEST_FILE = '.statusline-manifest.json';
+const UPDATE_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const UPDATE_MIN_BYTES = 4096;
+// Ceiling on any single download. Both scripts are ~40 KB; a response in the
+// megabytes is not this project and must not be buffered into memory.
+const UPDATE_MAX_BYTES = 5 * 1024 * 1024;
+
+/**
+ * Render-path half. Synchronous, allocation-free on the common path, and called
+ * only after stdout has been written. Must never throw and never block.
+ */
+function maybeSelfUpdate() {
+  try {
+    const dir = claudeDir();
+
+    const flag = fs.statSync(path.join(dir, UPDATE_FLAG_FILE), { throwIfNoEntry: false });
+    if (!flag) return;
+
+    const marker = path.join(dir, UPDATE_MARKER_FILE);
+    const stamp = fs.statSync(marker, { throwIfNoEntry: false });
+    if (stamp && Date.now() - stamp.mtimeMs < UPDATE_INTERVAL_MS) return;
+
+    // Touch the marker BEFORE spawning, not after. Two renders can overlap
+    // inside the 300ms debounce, and a network failure must not re-arm the
+    // check on every single render for the rest of the day.
+    fs.writeFileSync(marker, new Date().toISOString() + '\n');
+
+    const child = require('child_process').spawn(
+      process.execPath,
+      [__filename, '--self-update'],
+      { detached: true, stdio: 'ignore', windowsHide: true }
+    );
+    child.unref();
+  } catch {
+    // An updater that can blank the status bar is worse than a stale statusline.
+  }
+}
+
+/** GET as UTF-8 text, following redirects. Resolves null on any failure. */
+function updateFetch(https, url, redirects) {
+  return new Promise((resolve) => {
+    const req = https.get(
+      url,
+      { headers: { 'User-Agent': 'claude-statusline-selfupdate' } },
+      (res) => {
+        if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location && redirects > 0) {
+          res.resume();
+          const next = new URL(res.headers.location, url).toString();
+          // https only: a redirect must not downgrade the transport the whole
+          // update chain's integrity hangs on.
+          if (!next.startsWith('https://')) return resolve(null);
+          return resolve(updateFetch(https, next, redirects - 1));
+        }
+        if (res.statusCode !== 200) { res.resume(); return resolve(null); }
+        const chunks = [];
+        let total = 0;
+        res.on('data', (c) => {
+          total += c.length;
+          if (total > UPDATE_MAX_BYTES) { res.destroy(); return resolve(null); }
+          chunks.push(c);
+        });
+        res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+        res.on('error', () => resolve(null));
+      }
+    );
+    req.setTimeout(15000, () => req.destroy());
+    req.on('error', () => resolve(null));
+  });
+}
+
+/**
+ * Detached-child half. Nothing here is on the render path, so it may take as
+ * long as it likes. Every failure mode is "leave the installed file alone".
+ */
+async function selfUpdate() {
+  const https = require('https');
+  const crypto = require('crypto');
+  const { spawnSync } = require('child_process');
+
+  const dir = claudeDir();
+  const manifestPath = path.join(dir, UPDATE_MANIFEST_FILE);
+  const sha = (text) => crypto.createHash('sha256').update(text, 'utf8').digest('hex');
+
+  let manifest;
+  try {
+    manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  } catch {
+    return;                       // no manifest -> no baseline -> no update
+  }
+  if (!manifest || typeof manifest !== 'object' || !manifest.files) return;
+
+  // "owner/name" shape only: the value is interpolated into a URL path, and a
+  // manifest written by anything else must not point the fetch elsewhere.
+  const repo = typeof manifest.repo === 'string' && /^[\w.-]+\/[\w.-]+$/.test(manifest.repo)
+    ? manifest.repo
+    : UPDATE_REPO;
+  const ref = typeof manifest.ref === 'string' && manifest.ref ? manifest.ref : 'main';
+  let changed = false;
+
+  for (const name of UPDATE_FILES) {
+    const dest = path.join(dir, name);
+    const baseline = manifest.files[name];
+    if (typeof baseline !== 'string') continue;      // not installed by us
+
+    let current;
+    try { current = fs.readFileSync(dest, 'utf8'); } catch { continue; }
+    if (sha(current) !== baseline) continue;         // locally edited -- hands off
+
+    const url = `https://raw.githubusercontent.com/${repo}/${encodeURIComponent(ref)}/${name}`;
+    const next = await updateFetch(https, url, 5);
+
+    if (!next || next.length < UPDATE_MIN_BYTES) continue;
+    if (!next.startsWith('#!/usr/bin/env node')) continue;
+    const nextHash = sha(next);
+    if (nextHash === baseline) continue;             // already current
+
+    // Keep the `.js` extension: `node --check` on Node 20+ resolves a module
+    // format from the extension first and fails on anything it does not know.
+    const tmp = `${dest}.update.${process.pid}.js`;
+    try {
+      fs.writeFileSync(tmp, next, 'utf8');
+      const res = spawnSync(process.execPath, ['--check', tmp], { windowsHide: true });
+      if (res.status !== 0) { fs.unlinkSync(tmp); continue; }
+      fs.renameSync(tmp, dest);                      // atomic; a half-written
+      manifest.files[name] = nextHash;               // statusline is impossible
+      changed = true;
+    } catch {
+      try { fs.unlinkSync(tmp); } catch { /* best effort */ }
+    }
+  }
+
+  if (!changed) return;
+  try {
+    manifest.updatedAt = new Date().toISOString();
+    const tmp = `${manifestPath}.tmp.${process.pid}`;
+    fs.writeFileSync(tmp, JSON.stringify(manifest, null, 2) + '\n');
+    fs.renameSync(tmp, manifestPath);
+  } catch { /* the file is updated; a stale manifest only costs one no-op pass */ }
+}
+
+/* ---------------------------------------------------------------------------
  * Main
  * ------------------------------------------------------------------------ */
 
@@ -1150,7 +1359,7 @@ function main() {
 
   const agentName = data?.agent?.name;
   if (typeof agentName === 'string' && agentName.trim()) {
-    const clean = agentName.replace(/[\u0000-\u001f\u007f]/g, '').trim();
+    const clean = cleanText(agentName);
     if (clean) {
       const label = dim('Subagent Active:');
       // Reserve room for the label + its trailing space when clipping.
@@ -1164,12 +1373,21 @@ function main() {
   // row and looks like a rendering fault.
   const printable = lines.filter((l) => l !== '');
   process.stdout.write(printable.join('\n') + '\n');
+
+  // Strictly after the write, so nothing here can delay a single frame.
+  maybeSelfUpdate();
 }
 
-try {
-  main();
-} catch {
-  // Absolute last resort: never leave the status bar empty and never exit
-  // non-zero, which would make Claude Code log an error on every render.
-  try { process.stdout.write('Claude\n'); } catch { /* stdout is gone */ }
+if (process.argv.includes('--self-update')) {
+  // Detached child spawned by maybeSelfUpdate(). Never reads stdin, never
+  // prints, and its exit code is discarded.
+  selfUpdate().catch(() => {});
+} else {
+  try {
+    main();
+  } catch {
+    // Absolute last resort: never leave the status bar empty and never exit
+    // non-zero, which would make Claude Code log an error on every render.
+    try { process.stdout.write('Claude\n'); } catch { /* stdout is gone */ }
+  }
 }

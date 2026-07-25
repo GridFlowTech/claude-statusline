@@ -15,21 +15,32 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const crypto = require('crypto');
 const { spawnSync } = require('child_process');
 
 const ROOT = path.join(__dirname, '..');
 const MAIN = path.join(ROOT, 'statusline.js');
 const SUB = path.join(ROOT, 'subagent-statusline.js');
+const INSTALL = path.join(ROOT, 'install.js');
 const TRANSCRIPT = path.join(ROOT, 'examples', 'transcript.jsonl');
 
 let sandboxCounter = 0;
 const sandboxes = [];
 
+/**
+ * A sandbox path that is *not* created. The installer cases need to assert
+ * that it creates the directory itself, and that --dry-run does not.
+ */
+function sandboxPath() {
+  const dir = path.join(os.tmpdir(), `cs-test-${process.pid}-${sandboxCounter++}`);
+  sandboxes.push(dir);
+  return dir;
+}
+
 /** A fresh config dir per run: no shared ledger state between cases. */
 function sandbox() {
-  const dir = path.join(os.tmpdir(), `cs-test-${process.pid}-${sandboxCounter++}`);
+  const dir = sandboxPath();
   fs.mkdirSync(dir, { recursive: true });
-  sandboxes.push(dir);
   return dir;
 }
 
@@ -276,6 +287,37 @@ check('escape sequences in untrusted fields are stripped', () => {
   assertMatch(r.stdout, 'evil[31mRED', 'text preserved literally');
 });
 
+check('escape sequences in model name and effort level are stripped', () => {
+  const esc = String.fromCharCode(27);
+  const r = run(MAIN, basePayload({
+    model: { display_name: `Opus${esc}[31m 5` },
+    effort: { level: `high${esc}[2J` },
+  }));
+  assert(!r.stdout.includes(esc), 'raw ESC reached stdout');
+  assertMatch(r.stdout, 'Opus', 'model name still renders');
+});
+
+check('C1 control bytes are stripped from untrusted fields', () => {
+  const csi = String.fromCharCode(0x9b);   // 8-bit CSI, honoured by some terminals
+  const r = run(MAIN, basePayload({ session_name: `s${csi}31mX` }));
+  assert(!r.stdout.includes(csi), 'raw C1 CSI reached stdout');
+  assertMatch(r.stdout, 's31mX', 'text preserved literally');
+});
+
+check('a hostile session_id cannot become a ledger record', () => {
+  const dir = sandbox();
+  const r = run(MAIN, basePayload({ session_id: '__proto__' }), { configDir: dir });
+  assert(r.status === 0, `exit ${r.status}`);
+  const file = path.join(dir, 'cost_ledger.json');
+  if (fs.existsSync(file)) {
+    const store = JSON.parse(fs.readFileSync(file, 'utf8'));
+    assert(
+      !Object.prototype.hasOwnProperty.call(store.sessions, '__proto__'),
+      '__proto__ was written as a session key'
+    );
+  }
+});
+
 check('a named agent adds the trailing row', () => {
   const r = run(MAIN, basePayload({ agent: { name: 'cavecrew-reviewer' } }));
   assertMatch(r.stdout, 'Subagent Active: cavecrew-reviewer', 'agent row');
@@ -376,6 +418,329 @@ check('escape sequences in task text are stripped', () => {
     tasks: [{ id: 'x', name: `nm${esc}[31m`, status: 'running', description: `d${esc}[5m` }],
   });
   assert(!r.stdout.includes(esc), 'raw ESC reached stdout');
+});
+
+check('escape sequences in the effort field are stripped', () => {
+  const esc = String.fromCharCode(27);
+  const r = run(SUB, {
+    columns: 90,
+    tasks: [{ id: 'x', name: 'n', status: 'running', model: 'claude-opus-5', effort: `hi${esc}[31mgh` }],
+  });
+  assert(!r.stdout.includes(esc), 'raw ESC reached stdout');
+});
+
+/* ========================================================================== */
+
+console.log('\ninstall.js\n');
+
+/**
+ * Run the installer.
+ *
+ * Every case passes --local, so the working tree is the source and GitHub is
+ * never contacted: the suite stays hermetic and runs offline. `cwd` is pinned to
+ * the repo root because the piped form resolves its local source relative to the
+ * working directory, there being no script path to resolve it against.
+ *
+ * @param {string[]} args
+ * @param {object} [opts] { viaStdin } — pipe install.js into `node -`, which is
+ *   the shape the documented one-liner actually uses.
+ */
+function installer(args, opts = {}) {
+  const argv = opts.viaStdin ? ['-', ...args] : [INSTALL, ...args];
+  const res = spawnSync(process.execPath, argv, {
+    encoding: 'utf8',
+    cwd: ROOT,
+    input: opts.viaStdin ? fs.readFileSync(INSTALL, 'utf8') : '',
+    env: { ...process.env, NO_COLOR: '1' },
+  });
+  return { status: res.status, stdout: res.stdout || '', stderr: res.stderr || '' };
+}
+
+const sha256 = (text) => crypto.createHash('sha256').update(text, 'utf8').digest('hex');
+const readJson = (...p) => JSON.parse(fs.readFileSync(path.join(...p), 'utf8'));
+const exists = (...p) => fs.existsSync(path.join(...p));
+
+check('--help exits 0 and documents the piped one-liner', () => {
+  const r = installer(['--help']);
+  assert(r.status === 0, `exit ${r.status}`);
+  assertMatch(r.stdout, '| node -', 'the one-liner');
+  assertMatch(r.stdout, '--uninstall', 'the flag list');
+});
+
+check('an unknown flag exits 1 and names it', () => {
+  const r = installer(['--nope']);
+  assert(r.status === 1, `exit ${r.status}`);
+  assertMatch(r.stderr, 'unknown option: --nope', 'error text');
+});
+
+check('a flag missing its value exits 1', () => {
+  const r = installer(['--dir']);
+  assert(r.status === 1, `exit ${r.status}`);
+  assertMatch(r.stderr, '--dir needs a value', 'error text');
+});
+
+check('--dry-run creates nothing at all', () => {
+  const dir = sandboxPath();
+  const r = installer(['--dir', dir, '--local', '--dry-run']);
+  assert(r.status === 0, `exit ${r.status}\n${r.stderr}`);
+  assert(!fs.existsSync(dir), 'a dry run must not even create the config dir');
+  assertMatch(r.stdout, '[dry-run]', 'actions are labelled');
+  assertMatch(r.stdout, 'node --check ok', 'files are still verified');
+});
+
+check('a fresh install writes both scripts and both settings keys', () => {
+  const dir = sandboxPath();
+  const r = installer(['--dir', dir, '--local']);
+  assert(r.status === 0, `exit ${r.status}\n${r.stderr}`);
+  assert(exists(dir, 'statusline.js'), 'statusline.js');
+  assert(exists(dir, 'subagent-statusline.js'), 'subagent-statusline.js');
+  const cfg = readJson(dir, 'settings.json');
+  assert(cfg.statusLine.type === 'command', 'statusLine.type');
+  assert(cfg.subagentStatusLine.type === 'command', 'subagentStatusLine.type');
+});
+
+check('installed scripts are byte-identical to the working tree', () => {
+  const dir = sandboxPath();
+  installer(['--dir', dir, '--local']);
+  for (const [src, name] of [[MAIN, 'statusline.js'], [SUB, 'subagent-statusline.js']]) {
+    assert(
+      fs.readFileSync(src, 'utf8') === fs.readFileSync(path.join(dir, name), 'utf8'),
+      `${name} differs from the copy it was installed from`
+    );
+  }
+});
+
+check('the settings command is quoted and free of backslashes', () => {
+  const dir = sandboxPath();
+  installer(['--dir', dir, '--local']);
+  const { command } = readJson(dir, 'settings.json').statusLine;
+  assert(/^node "/.test(command), `expected a quoted path, got ${command}`);
+  // A backslash arrives at Git Bash as an escape character and the bar goes blank.
+  assertNotMatch(command, '\\', 'separator');
+  assertMatch(command, 'statusline.js"', 'points at the script');
+});
+
+check('unrelated settings keys survive and a backup is taken', () => {
+  const dir = sandbox();
+  fs.writeFileSync(
+    path.join(dir, 'settings.json'),
+    JSON.stringify({ model: 'opus', permissions: { allow: ['Bash'] }, hooks: { Stop: [] } })
+  );
+  installer(['--dir', dir, '--local']);
+
+  const cfg = readJson(dir, 'settings.json');
+  assert(cfg.model === 'opus', 'model key lost');
+  assert(cfg.permissions.allow[0] === 'Bash', 'permissions lost');
+  assert(cfg.hooks && cfg.hooks.Stop, 'hooks lost');
+
+  assert(exists(dir, 'settings.json.bak'), 'no backup written');
+  assert(readJson(dir, 'settings.json.bak').statusLine === undefined, 'the backup must predate our keys');
+});
+
+check('unparseable settings.json aborts before touching the disk', () => {
+  const dir = sandbox();
+  const file = path.join(dir, 'settings.json');
+  const broken = '{ "model": "opus", }';        // trailing comma: not JSON
+  fs.writeFileSync(file, broken);
+
+  const r = installer(['--dir', dir, '--local']);
+  assert(r.status === 1, `exit ${r.status}`);
+  assert(fs.readFileSync(file, 'utf8') === broken, 'settings.json was modified anyway');
+  assert(!exists(dir, 'statusline.js'), 'a script was written before the abort');
+  assert(!exists(dir, 'settings.json.bak'), 'a backup was written before the abort');
+  assertMatch(r.stderr, 'not valid JSON', 'explains why');
+});
+
+check('--main-only installs one half, --subagent-only the other', () => {
+  const a = sandboxPath();
+  installer(['--dir', a, '--local', '--main-only']);
+  assert(exists(a, 'statusline.js'), 'main script missing');
+  assert(!exists(a, 'subagent-statusline.js'), 'subagent script should be absent');
+  const cfgA = readJson(a, 'settings.json');
+  assert(cfgA.statusLine && !cfgA.subagentStatusLine, 'expected statusLine only');
+
+  const b = sandboxPath();
+  installer(['--dir', b, '--local', '--subagent-only']);
+  assert(!exists(b, 'statusline.js'), 'main script should be absent');
+  assert(exists(b, 'subagent-statusline.js'), 'subagent script missing');
+  const cfgB = readJson(b, 'settings.json');
+  assert(cfgB.subagentStatusLine && !cfgB.statusLine, 'expected subagentStatusLine only');
+});
+
+check('--interval overrides refreshInterval, which defaults to 30', () => {
+  const a = sandboxPath();
+  installer(['--dir', a, '--local']);
+  assert(readJson(a, 'settings.json').statusLine.refreshInterval === 30, 'default');
+
+  const b = sandboxPath();
+  installer(['--dir', b, '--local', '--interval', '5']);
+  assert(readJson(b, 'settings.json').statusLine.refreshInterval === 5, 'override');
+});
+
+check('a non-numeric --interval exits 1', () => {
+  const r = installer(['--dir', sandboxPath(), '--local', '--interval', 'soon']);
+  assert(r.status === 1, `exit ${r.status}`);
+  assertMatch(r.stderr, '--interval must be a number', 'error text');
+});
+
+check('the manifest records the sha256 of what was installed', () => {
+  const dir = sandboxPath();
+  installer(['--dir', dir, '--local']);
+  const manifest = readJson(dir, '.statusline-manifest.json');
+  for (const name of ['statusline.js', 'subagent-statusline.js']) {
+    assert(
+      manifest.files[name] === sha256(fs.readFileSync(path.join(dir, name), 'utf8')),
+      `${name}: manifest hash does not match the installed bytes`
+    );
+  }
+  assert(manifest.ref === 'main', `unexpected ref ${manifest.ref}`);
+});
+
+check('auto-update is off unless asked for, and can be turned back off', () => {
+  const dir = sandboxPath();
+  installer(['--dir', dir, '--local']);
+  assert(!exists(dir, '.statusline-autoupdate'), 'must be off by default');
+
+  installer(['--dir', dir, '--local', '--auto-update']);
+  assert(exists(dir, '.statusline-autoupdate'), '--auto-update did not set the flag');
+
+  installer(['--dir', dir, '--local', '--no-auto-update']);
+  assert(!exists(dir, '.statusline-autoupdate'), '--no-auto-update did not clear the flag');
+});
+
+check('reinstalling over an install is idempotent', () => {
+  const dir = sandboxPath();
+  installer(['--dir', dir, '--local']);
+  const first = fs.readFileSync(path.join(dir, 'settings.json'), 'utf8');
+  installer(['--dir', dir, '--local']);
+  assert(fs.readFileSync(path.join(dir, 'settings.json'), 'utf8') === first, 'a second install changed settings.json');
+});
+
+check('the piped `node -` form behaves like `node install.js`', () => {
+  const dir = sandboxPath();
+  const r = installer(['--dir', dir, '--local'], { viaStdin: true });
+  assert(r.status === 0, `exit ${r.status}\n${r.stderr}`);
+  assert(exists(dir, 'statusline.js'), 'statusline.js');
+  assert(readJson(dir, 'settings.json').statusLine, 'statusLine key');
+});
+
+check('--uninstall removes our keys and files but keeps the ledger', () => {
+  const dir = sandbox();
+  fs.writeFileSync(path.join(dir, 'settings.json'), JSON.stringify({ model: 'opus' }));
+  installer(['--dir', dir, '--local', '--auto-update']);
+  fs.writeFileSync(path.join(dir, 'cost_ledger.json'), '{"sessions":{}}');
+
+  const r = installer(['--dir', dir, '--uninstall']);
+  assert(r.status === 0, `exit ${r.status}\n${r.stderr}`);
+
+  const cfg = readJson(dir, 'settings.json');
+  assert(cfg.statusLine === undefined, 'statusLine key survived');
+  assert(cfg.subagentStatusLine === undefined, 'subagentStatusLine key survived');
+  assert(cfg.model === 'opus', 'an unrelated key was removed');
+
+  for (const name of ['statusline.js', 'subagent-statusline.js', '.statusline-manifest.json', '.statusline-autoupdate']) {
+    assert(!exists(dir, name), `${name} survived`);
+  }
+  assert(exists(dir, 'cost_ledger.json'), 'the ledger must be kept without --purge');
+});
+
+check('--uninstall --purge deletes the ledger too', () => {
+  const dir = sandboxPath();
+  installer(['--dir', dir, '--local']);
+  fs.writeFileSync(path.join(dir, 'cost_ledger.json'), '{"sessions":{}}');
+  installer(['--dir', dir, '--uninstall', '--purge']);
+  assert(!exists(dir, 'cost_ledger.json'), 'the ledger survived --purge');
+});
+
+check('--uninstall --main-only leaves the subagent half installed', () => {
+  const dir = sandboxPath();
+  installer(['--dir', dir, '--local']);
+  installer(['--dir', dir, '--uninstall', '--main-only']);
+  assert(!exists(dir, 'statusline.js'), 'main script survived');
+  assert(exists(dir, 'subagent-statusline.js'), 'subagent script was removed too');
+  const cfg = readJson(dir, 'settings.json');
+  assert(cfg.statusLine === undefined, 'statusLine key survived');
+  assert(cfg.subagentStatusLine, 'subagentStatusLine key was removed too');
+});
+
+/* ========================================================================== */
+
+console.log('\nself-update\n');
+
+/**
+ * Run the updater branch in the foreground. Every case here is arranged so the
+ * updater bails out before its first network call -- either the manifest is
+ * missing or the installed bytes no longer match it -- which keeps the suite
+ * offline while still exercising the guards that matter.
+ */
+function selfUpdate(dir) {
+  const res = spawnSync(process.execPath, [path.join(dir, 'statusline.js'), '--self-update'], {
+    encoding: 'utf8',
+    input: '',
+    cwd: ROOT,
+    env: { ...process.env, CLAUDE_CONFIG_DIR: dir },
+  });
+  return { status: res.status, stdout: res.stdout || '' };
+}
+
+check('a locally edited statusline is never overwritten', () => {
+  const dir = sandboxPath();
+  installer(['--dir', dir, '--local', '--main-only']);
+  const file = path.join(dir, 'statusline.js');
+  fs.appendFileSync(file, '\n// a tunable, edited by hand\n');
+  const before = fs.readFileSync(file, 'utf8');
+
+  const r = selfUpdate(dir);
+  assert(r.status === 0, `exit ${r.status}`);
+  assert(fs.readFileSync(file, 'utf8') === before, 'an edited file was reverted');
+});
+
+check('no manifest means no update attempt, and no output', () => {
+  const dir = sandboxPath();
+  installer(['--dir', dir, '--local', '--main-only']);
+  fs.unlinkSync(path.join(dir, '.statusline-manifest.json'));
+  const file = path.join(dir, 'statusline.js');
+  const before = fs.readFileSync(file, 'utf8');
+
+  const r = selfUpdate(dir);
+  assert(r.status === 0, `exit ${r.status}`);
+  assert(r.stdout === '', `expected silence, got ${JSON.stringify(r.stdout)}`);
+  assert(fs.readFileSync(file, 'utf8') === before, 'the script changed without a manifest');
+});
+
+check('a render leaves no update marker while auto-update is off', () => {
+  const dir = sandboxPath();
+  installer(['--dir', dir, '--local']);
+  run(path.join(dir, 'statusline.js'), basePayload(), { configDir: dir });
+  assert(!exists(dir, '.statusline-last-update'), 'the updater ran while disabled');
+});
+
+check('a render stamps the marker at most once a day', () => {
+  const dir = sandboxPath();
+  installer(['--dir', dir, '--local']);
+  // Removing the manifest makes the detached child a no-op, so this case
+  // exercises the render-path half without going near the network.
+  fs.unlinkSync(path.join(dir, '.statusline-manifest.json'));
+  fs.writeFileSync(path.join(dir, '.statusline-autoupdate'), '');
+
+  const marker = path.join(dir, '.statusline-last-update');
+  run(path.join(dir, 'statusline.js'), basePayload(), { configDir: dir });
+  assert(fs.existsSync(marker), 'the marker was not stamped');
+
+  const stamp = fs.readFileSync(marker, 'utf8');
+  run(path.join(dir, 'statusline.js'), basePayload(), { configDir: dir });
+  assert(fs.readFileSync(marker, 'utf8') === stamp, 're-stamped within the day');
+});
+
+check('a render is unaffected by a broken manifest', () => {
+  const dir = sandboxPath();
+  installer(['--dir', dir, '--local']);
+  fs.writeFileSync(path.join(dir, '.statusline-manifest.json'), 'not json');
+  fs.writeFileSync(path.join(dir, '.statusline-autoupdate'), '');
+
+  const r = run(path.join(dir, 'statusline.js'), basePayload(), { configDir: dir });
+  assert(r.status === 0, `exit ${r.status}`);
+  assert(r.lines.length >= 3, `expected >=3 lines, got ${r.lines.length}`);
 });
 
 /* ========================================================================== */
