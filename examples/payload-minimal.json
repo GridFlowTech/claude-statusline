@@ -1,0 +1,15 @@
+{
+  "cwd": "/home/you/code/my-project",
+  "session_id": "00000000-0000-4000-8000-000000000000",
+  "model": { "display_name": "Opus 5" },
+  "cost": { "total_cost_usd": 0 },
+  "context_window": {
+    "total_input_tokens": 0,
+    "total_output_tokens": 0,
+    "context_window_size": 200000,
+    "used_percentage": null,
+    "remaining_percentage": null,
+    "current_usage": null
+  },
+  "rate_limits": null
+}

@@ -1,0 +1,52 @@
+{
+  "cwd": "/home/you/code/my-project",
+  "session_id": "e7b47fc8-b328-42cc-96c1-ff341f7944d8",
+  "session_name": "statusline-hardening",
+  "transcript_path": "examples/transcript.jsonl",
+  "model": {
+    "id": "claude-opus-5",
+    "display_name": "Opus 5 (1M context)"
+  },
+  "workspace": {
+    "current_dir": "/home/you/code/my-project",
+    "project_dir": "/home/you/code/my-project",
+    "added_dirs": [],
+    "git_worktree": "feature-xyz",
+    "repo": {
+      "host": "github.com",
+      "owner": "you",
+      "name": "my-project"
+    }
+  },
+  "version": "2.1.220",
+  "output_style": { "name": "default" },
+  "cost": {
+    "total_cost_usd": 4.8712,
+    "total_duration_ms": 3600000,
+    "total_api_duration_ms": 900000,
+    "total_lines_added": 156,
+    "total_lines_removed": 23
+  },
+  "context_window": {
+    "total_input_tokens": 152000,
+    "total_output_tokens": 878,
+    "context_window_size": 1000000,
+    "used_percentage": 15.2,
+    "remaining_percentage": 84.8,
+    "current_usage": {
+      "input_tokens": 2,
+      "output_tokens": 878,
+      "cache_creation_input_tokens": 12000,
+      "cache_read_input_tokens": 140000
+    }
+  },
+  "exceeds_200k_tokens": false,
+  "fast_mode": true,
+  "effort": { "level": "xhigh" },
+  "thinking": { "enabled": true },
+  "rate_limits": {
+    "five_hour": { "used_percentage": 90, "resets_at": 1784980000 },
+    "seven_day": { "used_percentage": 52, "resets_at": 1785400000 }
+  },
+  "agent": { "name": "cavecrew-reviewer" }
+}

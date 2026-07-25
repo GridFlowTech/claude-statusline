@@ -1,0 +1,1175 @@
+#!/usr/bin/env node
+'use strict';
+/* ============================================================================
+ * Claude Code statusline  —  Node.js implementation (Windows-first)
+ * ----------------------------------------------------------------------------
+ * WHY NODE AND NOT POWERSHELL
+ *   Claude Code re-runs the statusline command on every assistant message,
+ *   /compact, permission-mode change and vim-mode toggle, debounced at 300ms.
+ *   `powershell.exe` costs ~600-900ms of boot before a single byte is printed,
+ *   which makes the bar visibly stutter. `node` cold-starts in ~35-50ms and we
+ *   only ever require() built-ins (fs / path / os) -- no module resolution walk,
+ *   no child processes, no network. One synchronous stdout write at the end.
+ *
+ * CONTRACT
+ *   stdin  : one JSON object (schema: https://code.claude.com/docs/en/statusline)
+ *   stdout : 4 lines, plus an optional 5th when a named agent is active.
+ *              1. model and mode flags
+ *              2. runway   -- context, cache, LngCtx, both rate-limit windows
+ *              3. money    -- session / day / week / month, and burn rate
+ *              4. place    -- repo, branch and working-tree state, session name
+ *
+ *   The optional 5th row reads `agent.name`, which is the SESSION's own agent
+ *   (--agent flag or agent settings), not a Task-tool subagent. Per-subagent
+ *   rows are a separate `subagentStatusLine` setting entirely.
+ *   Nothing is ever thrown out of this file. A crash would blank the user's
+ *   status bar, so every stage is individually guarded and the top level has a
+ *   last-resort catch that still prints something useful.
+ *
+ * NULL SAFETY
+ *   Per the docs, `context_window.current_usage` is null before the first API
+ *   call of a session AND again after /compact until the next response.
+ *   `used_percentage` / `remaining_percentage` may be null early on, and the
+ *   whole `rate_limits` object is absent on API/enterprise billing. Therefore
+ *   every single field read below goes through `?.` + `??` or a numeric
+ *   coercion helper. Never assume an object exists just because its parent did.
+ * ========================================================================== */
+
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+
+/* ---------------------------------------------------------------------------
+ * Tunables. Edit these; everything below reads from here.
+ * ------------------------------------------------------------------------ */
+
+// Prefix each cost amount with a dim S / D / W / M key (session, day, week,
+// month). Set false for bare amounts ("$0.12 · $3.40 · ..."), which is 8
+// columns narrower but relies on you remembering the order.
+const SHOW_COST_LABELS = true;
+
+// Some Windows console fonts (raster "Terminal", older Consolas fallbacks)
+// render U+2191/2192/2193 as boxes. Set CC_STATUSLINE_ASCII=1 to get ^ = v.
+const ASCII_ARROWS = process.env.CC_STATUSLINE_ASCII === '1';
+
+// Sessions older than this drop out of the ledger so the file stays small and
+// the monthly roll-up stays fast. 45d covers "current month" from any day.
+const LEDGER_RETENTION_DAYS = 45;
+
+// Rate-limit window lengths, in seconds. Fixed by the product, not by payload.
+const FIVE_HOUR_SECONDS = 18000;   // 5 * 3600
+const SEVEN_DAY_SECONDS = 604800;  // 7 * 86400
+
+// Pace arrows are meaningless in the first sliver of a window: with `elapsed`
+// near zero the expected% is ~0, so any usage at all reads as "burning fast"
+// and projects an absurd exhaustion time. Suppress until 2% of the window has
+// passed (6 min into a 5h window, ~3.4h into a 7d window). Same guard as the
+// reference bash implementation.
+const PACE_MIN_ELAPSED_FRACTION = 1 / 50;
+
+// On-pace band, expressed as the projected end-of-window percentage:
+//   projected% = used% * duration / elapsed
+// i.e. "if I keep burning at this rate, where do I land when the window
+// resets". Above 115 is burning fast, below 85 is under-consuming, between is
+// on pace. This is a RATIO band, not a fixed point spread, which is what makes
+// it behave sensibly at both ends of a window -- a 5-point spread is far too
+// tight at hour 4 of 5 and far too loose at hour 1.
+const PACE_FAST_PROJECTED = 115;
+const PACE_SLOW_PROJECTED = 85;
+
+/* ---------------------------------------------------------------------------
+ * Git. One subprocess per render, and only when we are actually inside a repo.
+ * ------------------------------------------------------------------------ */
+
+// A hung git (network filesystem, index.lock contention) must never freeze the
+// status bar. spawnSync kills the child at this deadline.
+const GIT_TIMEOUT_MS = 800;
+
+// Background `git fetch` debounce, per branch. Matches the reference.
+const FETCH_DEBOUNCE_SECONDS = 600;
+
+// Set CC_STATUSLINE_NOGIT=1 to skip the git subprocess entirely.
+const GIT_ENABLED = process.env.CC_STATUSLINE_NOGIT !== '1';
+
+/* ---------------------------------------------------------------------------
+ * ANSI. Honors the NO_COLOR convention (https://no-color.org) and skips colour
+ * when the output is being captured by something that asked for plain text.
+ * ------------------------------------------------------------------------ */
+
+const USE_COLOR = !process.env.NO_COLOR && process.env.CC_STATUSLINE_NOCOLOR !== '1';
+const E = '\u001b[';   // CSI as an escape, not a raw 0x1B byte
+const paint = (code, s) => (USE_COLOR && s !== '' ? `${E}${code}m${s}${E}0m` : s);
+
+const dim = (s) => paint('2', s);
+const bold = (s) => paint('1', s);
+const red = (s) => paint('38;5;203', s);
+const yellow = (s) => paint('38;5;179', s);
+const green = (s) => paint('38;5;108', s);
+const cyan = (s) => paint('38;5;110', s);
+const orange = (s) => paint('38;5;172', s);   // caveman plugin's own colour
+const sage = (s) => paint('38;5;108', s);     // ponytail plugin's own colour
+const magenta = (s) => paint('38;5;176', s);  // git branch
+
+const SEP = dim(' · ');                   // " · "
+
+/* ---------------------------------------------------------------------------
+ * stdin
+ * ------------------------------------------------------------------------ */
+
+/** Block the thread for `ms` without spinning the CPU or the event loop. */
+function sleepSync(ms) {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    /* SharedArrayBuffer unavailable (hardened runtime) -- fall through hot. */
+  }
+}
+
+/**
+ * Read all of stdin synchronously.
+ *
+ * `fs.readFileSync(0)` is the usual one-liner but it throws EAGAIN when the
+ * parent handed us a non-blocking pipe, which does happen on Windows depending
+ * on how the host spawns us. So: loop on readSync, tolerate EAGAIN with a short
+ * backoff, treat EOF/0-bytes as end of stream, and hard-cap the total wait so a
+ * parent that never closes the pipe can't hang the status bar forever.
+ */
+function readStdin() {
+  const CHUNK = 65536;
+  const buf = Buffer.alloc(CHUNK);
+  const parts = [];
+  const deadline = Date.now() + 500;
+
+  for (;;) {
+    let bytes;
+    try {
+      bytes = fs.readSync(0, buf, 0, CHUNK, null);
+    } catch (err) {
+      if (err && err.code === 'EAGAIN' && Date.now() < deadline) {
+        sleepSync(2);
+        continue;
+      }
+      // EOF is how Windows signals end-of-pipe on some handles; anything else
+      // is unrecoverable and we just use whatever we already collected.
+      break;
+    }
+    if (!bytes) break;
+    parts.push(Buffer.from(buf.subarray(0, bytes)));
+  }
+
+  return Buffer.concat(parts).toString('utf8');
+}
+
+/* ---------------------------------------------------------------------------
+ * Small helpers
+ * ------------------------------------------------------------------------ */
+
+/** Coerce to a finite number, else null. Guards against null/""/NaN/"abc". */
+function num(v) {
+  if (v === null || v === undefined || v === '') return null;
+  const n = typeof v === 'number' ? v : Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+/** 8500 -> "8,500". Purely cosmetic grouping; the value is unchanged. */
+function group(n) {
+  return String(Math.round(n)).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+function money(n) {
+  return '$' + (Number.isFinite(n) ? n : 0).toFixed(2);
+}
+
+/** Epoch seconds -> local "HH:MM", 24-hour, zero-padded. */
+function clock(epochSeconds) {
+  const d = new Date(epochSeconds * 1000);
+  if (Number.isNaN(d.getTime())) return '';
+  return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+}
+
+/** Colour a 0-100 percentage by how alarming it is. */
+function pctColor(p) {
+  if (p >= 90) return red;
+  if (p >= 70) return yellow;
+  return green;
+}
+
+/** Honors CLAUDE_CONFIG_DIR the same way Claude Code and both plugins do. */
+function claudeDir() {
+  return process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
+}
+
+/* ---------------------------------------------------------------------------
+ * Width-aware layout
+ * ----------------------------------------------------------------------------
+ * Claude Code captures our stdout instead of attaching it to the terminal, so
+ * `tput cols` and process.stdout.columns both read as undefined from in here.
+ * The host instead exports COLUMNS/LINES before running us (v2.1.153+). If a
+ * line would wrap, wrapping costs a whole extra terminal row and shuffles the
+ * bar -- far worse than quietly dropping the least useful cell. So each line is
+ * assembled as prioritised cells and trimmed to fit.
+ *
+ * cell.rank: 0 = never drop. Higher = dropped sooner.
+ * ------------------------------------------------------------------------ */
+
+const ANSI_RE = /\u001b\[[0-9;]*m/g;
+
+/** Printable width, ignoring SGR sequences. All glyphs we emit are 1 column. */
+function visibleWidth(s) {
+  return String(s).replace(ANSI_RE, '').length;
+}
+
+/** Terminal width reported by the host, minus a safety column. null = unknown. */
+function terminalWidth() {
+  const cols = num(process.env.COLUMNS);
+  if (cols === null || cols < 20) return null;   // absurd value: don't trim
+  return Math.floor(cols) - 2;
+}
+
+const cell = (text, rank) => (text ? { text, rank } : null);
+
+/** Join cells with `sep`, dropping the highest-ranked ones until it fits. */
+function fit(cells, sep, maxWidth) {
+  const list = cells.filter((c) => c && c.text);
+  const sepW = visibleWidth(sep);
+  const widthOf = (l) =>
+    l.reduce((sum, c) => sum + visibleWidth(c.text), 0) + Math.max(0, l.length - 1) * sepW;
+
+  if (maxWidth !== null) {
+    while (list.length > 1 && widthOf(list) > maxWidth) {
+      let victim = -1;
+      let worstRank = 0;
+      for (let i = 0; i < list.length; i++) {
+        // `>=` so an equal-rank tie drops the RIGHTMOST cell. Trailing detail
+        // disappearing before leading detail preserves reading order.
+        if (list[i].rank >= worstRank && list[i].rank > 0) { worstRank = list[i].rank; victim = i; }
+      }
+      if (victim < 0) break;   // everything left is rank 0
+      list.splice(victim, 1);
+    }
+  }
+
+  return list.map((c) => c.text).join(sep);
+}
+
+/** Clip to `max` printable chars. Only ever applied to colour-free text. */
+function clip(s, max) {
+  const str = String(s);
+  return str.length <= max ? str : str.slice(0, Math.max(1, max - 2)) + '..';
+}
+
+/* ---------------------------------------------------------------------------
+ * Token-efficiency plugin detection (caveman / ponytail)
+ * ----------------------------------------------------------------------------
+ * Both plugins share a design: a tiny flag file under ~/.claude holding the
+ * live mode string, an env var holding the *default* mode, and an optional
+ * config.json. The flag file is the runtime source of truth -- the env var only
+ * says what a fresh session starts as -- so it is checked first.
+ *
+ * Hardening (mirrors the plugins' own statusline scripts): the flag contents
+ * land in a terminal, so refuse symlinks/junctions and oversized files, strip
+ * everything outside [a-z0-9-], then whitelist. Without this, anything that can
+ * write that path could emit escape sequences into the user's terminal on every
+ * keystroke.
+ * ------------------------------------------------------------------------ */
+
+const VALID_MODES = new Set([
+  'off', 'lite', 'full', 'ultra', 'review', 'commit', 'compress',
+  'wenyan', 'wenyan-lite', 'wenyan-full', 'wenyan-ultra',
+]);
+
+function sanitizeMode(raw) {
+  if (typeof raw !== 'string') return null;
+  const m = raw.split(/\r?\n/, 1)[0].trim().toLowerCase().replace(/[^a-z0-9-]/g, '');
+  if (!m || !VALID_MODES.has(m)) return null;
+  return m === 'off' ? null : m;   // "off" means installed-but-inactive
+}
+
+function readFlagFile(file) {
+  try {
+    const st = fs.lstatSync(file);
+    if (st.isSymbolicLink() || !st.isFile() || st.size > 64) return null;
+    return sanitizeMode(fs.readFileSync(file, 'utf8'));
+  } catch {
+    return null;   // absent == not active; never a reason to fail a render
+  }
+}
+
+function readConfigMode(pluginName) {
+  const dirs = [];
+  if (process.env.XDG_CONFIG_HOME) dirs.push(path.join(process.env.XDG_CONFIG_HOME, pluginName));
+  if (process.platform === 'win32') {
+    dirs.push(path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), pluginName));
+  }
+  dirs.push(path.join(os.homedir(), '.config', pluginName));
+
+  for (const dir of dirs) {
+    try {
+      const cfg = JSON.parse(fs.readFileSync(path.join(dir, 'config.json'), 'utf8'));
+      const mode = sanitizeMode(cfg && cfg.defaultMode);
+      if (mode) return mode;
+    } catch {
+      /* missing or malformed -- try the next location */
+    }
+  }
+  return null;
+}
+
+/**
+ * @returns uppercase level string, or null when the plugin is not active.
+ * Resolution order: live flag file > env default > config.json default.
+ */
+function detectPlugin(pluginName, envVar) {
+  const mode =
+    readFlagFile(path.join(claudeDir(), `.${pluginName}-active`)) ||
+    sanitizeMode(process.env[envVar]) ||
+    readConfigMode(pluginName);
+  return mode ? mode.toUpperCase() : null;
+}
+
+/* ---------------------------------------------------------------------------
+ * Git state
+ * ----------------------------------------------------------------------------
+ * The reference bash implementation shells out four times per render: symbolic-
+ * ref, status --porcelain, and two rev-list calls for ahead/behind. On Windows
+ * each process spawn costs 30-60ms, so four of them would triple the render
+ * budget on their own.
+ *
+ * `status --porcelain=v1 --branch` returns all four answers in ONE process: the
+ * branch name, the upstream tracking gap, and every file's staged/worktree
+ * state. Repo root is found by walking up for `.git` in pure JS rather than
+ * spending a fifth process on rev-parse --show-toplevel.
+ * ------------------------------------------------------------------------ */
+
+/** Walk up from `startDir` looking for `.git` (a dir normally, a file in a
+ *  linked worktree). Returns the repo root, or null. */
+function findRepoRoot(startDir) {
+  let dir = startDir;
+  for (let hops = 0; hops < 64; hops++) {
+    try {
+      if (fs.existsSync(path.join(dir, '.git'))) return dir;
+    } catch {
+      return null;
+    }
+    const parent = path.dirname(dir);
+    if (!parent || parent === dir) return null;   // hit the drive root
+    dir = parent;
+  }
+  return null;
+}
+
+/**
+ * Parse `git status --porcelain=v1 --branch` into a flat summary.
+ * @returns {{branch,detached,ahead,behind,staged,modified,untracked}|null}
+ */
+function gitStatus(cwd) {
+  let res;
+  try {
+    const { spawnSync } = require('child_process');
+    res = spawnSync(
+      'git',
+      ['--no-optional-locks', 'status', '--porcelain=v1', '--branch', '--untracked-files=normal'],
+      { cwd, encoding: 'utf8', timeout: GIT_TIMEOUT_MS, windowsHide: true, maxBuffer: 8 * 1024 * 1024 }
+    );
+  } catch {
+    return null;
+  }
+  if (!res || res.error || res.status !== 0 || typeof res.stdout !== 'string') return null;
+
+  const lines = res.stdout.split('\n');
+  const out = { branch: '', detached: false, ahead: 0, behind: 0, staged: 0, modified: 0, untracked: 0 };
+
+  // Header forms:
+  //   ## main...origin/main [ahead 1, behind 2]
+  //   ## main...origin/main [gone]
+  //   ## main
+  //   ## HEAD (no branch)
+  //   ## No commits yet on main
+  const head = lines[0] || '';
+  if (head.startsWith('## ')) {
+    let rest = head.slice(3);
+    if (rest === 'HEAD (no branch)') {
+      out.detached = true;
+      out.branch = 'detached';
+    } else {
+      rest = rest.replace(/^(?:No commits yet on |Initial commit on )/, '');
+      const gap = rest.match(/ \[(.+)\]$/);
+      if (gap) {
+        rest = rest.slice(0, gap.index);
+        const a = gap[1].match(/ahead (\d+)/);
+        const b = gap[1].match(/behind (\d+)/);
+        if (a) out.ahead = Number(a[1]);
+        if (b) out.behind = Number(b[1]);
+      }
+      // Strip the ...upstream half. Branch names may legally contain dots, so
+      // split on the last occurrence rather than the first.
+      const sep = rest.lastIndexOf('...');
+      out.branch = sep === -1 ? rest : rest.slice(0, sep);
+    }
+  }
+
+  // XY status codes. X = index/staged, Y = worktree.
+  for (let i = 1; i < lines.length; i++) {
+    const l = lines[i];
+    if (l.length < 2) continue;
+    if (l[0] === '?' && l[1] === '?') { out.untracked++; continue; }
+    if ('MADRC'.includes(l[0])) out.staged++;
+    if (l[1] === 'M' || l[1] === 'D') out.modified++;
+  }
+
+  return out;
+}
+
+/**
+ * Kick off a detached `git fetch` so ahead/behind counts stay meaningful.
+ *
+ * Deliberately narrow, matching the reference: only repos that have a `local/`
+ * directory opt in, and at most once per 600s per branch. A fetch on every
+ * render would hammer the remote and stall on any repo behind a slow network.
+ *
+ * The timestamp is stamped BEFORE spawning, so a fetch that fails still
+ * debounces -- otherwise a broken remote means a fetch attempt every render.
+ */
+function maybeBackgroundFetch(repoRoot, branch, nowSeconds) {
+  try {
+    const localDir = path.join(repoRoot, 'local');
+    if (!fs.statSync(localDir, { throwIfNoEntry: false })?.isDirectory()) return;
+
+    const lockPath = path.join(localDir, '.fetch-lock');
+
+    // TSV: "<branch>\t<epoch seconds>" per line.
+    const entries = new Map();
+    try {
+      for (const line of fs.readFileSync(lockPath, 'utf8').split('\n')) {
+        const tab = line.indexOf('\t');
+        if (tab > 0) entries.set(line.slice(0, tab), num(line.slice(tab + 1)) ?? 0);
+      }
+    } catch {
+      /* first run for this repo */
+    }
+
+    const last = entries.get(branch);
+    if (last && nowSeconds - last <= FETCH_DEBOUNCE_SECONDS) return;
+
+    entries.set(branch, nowSeconds);
+    const tmp = `${lockPath}.${process.pid}.tmp`;
+    const body = [...entries].map(([b, t]) => `${b}\t${t}`).join('\n') + '\n';
+    fs.writeFileSync(tmp, body, 'utf8');
+    fs.renameSync(tmp, lockPath);
+
+    const { spawn } = require('child_process');
+    const child = spawn('git', ['--no-optional-locks', 'fetch', '--quiet', '--prune'], {
+      cwd: repoRoot,
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    child.unref();   // let this process exit while the fetch continues
+  } catch {
+    /* fetch is best-effort; never let it affect the render */
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * Cost ledger
+ * ----------------------------------------------------------------------------
+ * The payload only ever exposes `cost.total_cost_usd` for the *current* session
+ * and it resets to $0 on /clear. To get day/week/month totals we keep our own
+ * append-and-max ledger at ~/.claude/cost_ledger.json:
+ *
+ *   { "v": 1, "sessions": { "<session_id>": { first, last, cost } } }
+ *
+ *   first : epoch ms the session was first observed -- the bucketing anchor
+ *   last  : epoch ms of the most recent render -- drives retention pruning
+ *   cost  : the highest total_cost_usd ever seen for that id
+ *
+ * Why max-observed rather than last-observed: total_cost_usd is monotonic
+ * within a session, but a resumed/forked session can briefly report a lower
+ * figure before the first API call repopulates it. Taking the max makes the
+ * ledger immune to that without needing to understand why it happened.
+ *
+ * Why bucket on `first` and not `last`: a session that spans midnight would
+ * otherwise migrate its whole accumulated cost into the new day, making
+ * yesterday's total silently shrink. Anchoring on first-seen keeps every
+ * historical bucket stable once written.
+ * ------------------------------------------------------------------------ */
+
+function ledgerPath() {
+  return path.join(claudeDir(), 'cost_ledger.json');
+}
+
+/**
+ * Accumulate this session's REAL token totals by tailing its transcript.
+ *
+ * Why this exists: the payload has no cumulative output count. Both
+ * `context_window.total_output_tokens` and `current_usage.output_tokens` are
+ * the most recent response only, so "Out" would sit at a few hundred forever
+ * while "In" grew all session -- which is exactly the asymmetry that reads as
+ * broken. The transcript is the only place the full history lives.
+ *
+ * Two things make this cheap and correct:
+ *
+ *   1. INCREMENTAL. The byte offset already consumed is kept in the ledger, so
+ *      each render parses only the bytes appended since the last one. Only the
+ *      first render of a pre-existing session pays for a full scan (~9ms for a
+ *      1.3MB transcript, and most lines are skipped without parsing at all).
+ *
+ *   2. DEDUPED. One assistant response is written to the transcript several
+ *      times as it streams, every copy carrying the SAME usage object. Summing
+ *      naively overcounts by ~1.8x. Records for a given message id are always
+ *      contiguous (verified across a full session: zero non-contiguous
+ *      repeats), so tracking the last counted id is sufficient -- and that id
+ *      is persisted too, so a run that straddles a read boundary is handled.
+ *
+ * @returns {{out:number,input:number,cacheCreate:number,cacheRead:number}|null}
+ */
+function accumulateTranscript(rec, transcriptPath) {
+  if (!rec || typeof transcriptPath !== 'string' || !transcriptPath) return null;
+
+  let size;
+  try {
+    const st = fs.statSync(transcriptPath, { throwIfNoEntry: false });
+    if (!st || !st.isFile()) return null;
+    size = st.size;
+  } catch {
+    return null;
+  }
+
+  // A shrunk file means it was replaced or rewritten (session fork, resume,
+  // manual edit). Anything we accumulated no longer describes it.
+  if (rec.tPath !== transcriptPath || num(rec.tOff) === null || rec.tOff > size) {
+    rec.tPath = transcriptPath;
+    rec.tOff = 0;
+    rec.tId = '';
+    rec.tOut = 0;
+    rec.tIn = 0;
+    rec.tCc = 0;
+    rec.tCr = 0;
+  }
+
+  if (size > rec.tOff) {
+    let chunk = '';
+    try {
+      const fd = fs.openSync(transcriptPath, 'r');
+      try {
+        const len = size - rec.tOff;
+        const buf = Buffer.alloc(len);
+        const read = fs.readSync(fd, buf, 0, len, rec.tOff);
+        chunk = buf.subarray(0, read).toString('utf8');
+        rec.tOff += read;
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch {
+      return tokenTotals(rec);
+    }
+
+    // The writer may be mid-append: rewind to the last complete line so no
+    // partial JSON is parsed and no bytes are skipped next time.
+    const lastNewline = chunk.lastIndexOf('\n');
+    if (lastNewline === -1) {
+      rec.tOff -= Buffer.byteLength(chunk, 'utf8');
+      return tokenTotals(rec);
+    }
+    const tail = chunk.slice(lastNewline + 1);
+    if (tail) rec.tOff -= Buffer.byteLength(tail, 'utf8');
+
+    for (const line of chunk.slice(0, lastNewline).split('\n')) {
+      // Cheap pre-filter: most lines are user turns and tool results with no
+      // usage block at all, and skipping JSON.parse on those is most of the
+      // speed. Note the transcript writes `"usage"` unspaced.
+      if (!line || line.indexOf('"usage"') === -1) continue;
+
+      let o;
+      try {
+        o = JSON.parse(line);
+      } catch {
+        continue;   // truncated or malformed line: skip, never throw
+      }
+
+      const u = o?.message?.usage;
+      if (!u) continue;
+
+      const id = o.message.id || o.requestId || '';
+      if (id && id === rec.tId) continue;   // same response, streamed again
+      rec.tId = id;
+
+      rec.tOut += num(u.output_tokens) ?? 0;
+      rec.tIn += num(u.input_tokens) ?? 0;
+      rec.tCc += num(u.cache_creation_input_tokens) ?? 0;
+      rec.tCr += num(u.cache_read_input_tokens) ?? 0;
+    }
+  }
+
+  return tokenTotals(rec);
+}
+
+function tokenTotals(rec) {
+  return {
+    out: num(rec.tOut) ?? 0,
+    input: num(rec.tIn) ?? 0,
+    cacheCreate: num(rec.tCc) ?? 0,
+    cacheRead: num(rec.tCr) ?? 0,
+  };
+}
+
+function loadLedger(file) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (parsed && typeof parsed === 'object' && parsed.sessions && typeof parsed.sessions === 'object') {
+      return parsed;
+    }
+  } catch {
+    /* absent on first run, or corrupt after a hard kill -- start clean */
+  }
+  return { v: 1, sessions: {} };
+}
+
+/**
+ * Write via temp-file + rename so a render that dies mid-write (Claude Code
+ * cancels in-flight statusline processes when a new update arrives) can never
+ * leave a truncated JSON file behind. rename() replaces atomically on Win32.
+ */
+function saveLedger(file, data) {
+  const tmp = `${file}.${process.pid}.tmp`;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(tmp, JSON.stringify(data), 'utf8');
+    fs.renameSync(tmp, file);
+  } catch {
+    try { fs.unlinkSync(tmp); } catch { /* nothing else to do */ }
+  }
+}
+
+/**
+ * Record this render's session cost and roll up the historical buckets.
+ * @returns {{session:number, day:number, week:number, month:number}}
+ */
+function updateLedger(sessionId, sessionCost, transcriptPath) {
+  const cost = num(sessionCost) ?? 0;
+  const totals = { session: cost, day: cost, week: cost, month: cost, tokens: null };
+
+  let file;
+  try { file = ledgerPath(); } catch { return totals; }
+
+  const now = Date.now();
+  const store = loadLedger(file);
+  let dirty = false;
+
+  // --- record / update the current session -------------------------------
+  if (sessionId) {
+    let rec = store.sessions[sessionId];
+    if (!rec || typeof rec !== 'object') {
+      rec = store.sessions[sessionId] = { first: now, last: now, cost };
+      dirty = true;
+    } else {
+      const best = Math.max(num(rec.cost) ?? 0, cost);
+      // Only rewrite when the number actually moved. At a 300ms debounce this
+      // turns most renders into a pure read and keeps the disk quiet.
+      if (best !== rec.cost) { rec.cost = best; dirty = true; }
+      if (!num(rec.first)) { rec.first = now; dirty = true; }
+    }
+
+    // Token accumulation shares the ledger read/write: a separate store would
+    // mean two file round-trips per render for the same session record.
+    const beforeOffset = rec.tOff;
+    try {
+      totals.tokens = accumulateTranscript(rec, transcriptPath);
+    } catch {
+      totals.tokens = null;
+    }
+    if (rec.tOff !== beforeOffset) dirty = true;
+
+    if (dirty) rec.last = now;
+  }
+
+  // --- prune anything past the retention horizon --------------------------
+  const cutoff = now - LEDGER_RETENTION_DAYS * 86400000;
+  for (const [id, rec] of Object.entries(store.sessions)) {
+    const stamp = num(rec && (rec.last ?? rec.first));
+    if (stamp === null || stamp < cutoff) {
+      delete store.sessions[id];
+      dirty = true;
+    }
+  }
+
+  // --- roll up ------------------------------------------------------------
+  const d = new Date(now);
+  const startOfToday = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const startOfWeek = startOfToday - 6 * 86400000;                      // today + previous 6 days
+  const startOfMonth = new Date(d.getFullYear(), d.getMonth(), 1).getTime();
+
+  totals.day = 0;
+  totals.week = 0;
+  totals.month = 0;
+  for (const rec of Object.values(store.sessions)) {
+    const c = num(rec && rec.cost);
+    const anchor = num(rec && (rec.first ?? rec.last));
+    if (c === null || anchor === null) continue;
+    if (anchor >= startOfToday) totals.day += c;
+    if (anchor >= startOfWeek) totals.week += c;
+    if (anchor >= startOfMonth) totals.month += c;
+  }
+
+  // A brand-new session that hasn't been flushed yet must still appear in the
+  // live totals, and a session id we never got must not vanish from them.
+  if (!sessionId) {
+    totals.day += cost;
+    totals.week += cost;
+    totals.month += cost;
+  }
+
+  if (dirty) saveLedger(file, store);
+  return totals;
+}
+
+/* ---------------------------------------------------------------------------
+ * Pace arrows
+ * ----------------------------------------------------------------------------
+ * Ported from the bash reference. The payload gives `used_percentage` and
+ * `resets_at`, and every window has a fixed length, so the window's start is
+ * simply resets_at - duration. From there:
+ *
+ *   elapsed   = now - start
+ *   expected% = elapsed / duration * 100        (what linear burn would show)
+ *
+ *   used > expected  -> burning fast. Projected 100% is reached at
+ *                       start + elapsed * (100 / used). Note this epoch is
+ *                       provably earlier than resets_at exactly when
+ *                       used > expected, so the ETA is always meaningful here.
+ *   |used-expected| <= 5 points -> on pace.
+ *   used < expected  -> under-consuming.
+ * ------------------------------------------------------------------------ */
+
+function paceArrow(usedPct, resetsAt, durationSeconds, nowSeconds) {
+  const used = num(usedPct);
+  const resets = num(resetsAt);
+  const blank = { onPace: null, arrow: '' };
+  if (used === null || resets === null) return blank;
+
+  const start = resets - durationSeconds;
+  const elapsed = nowSeconds - start;
+
+  // Too early for the ratio to mean anything, or the stamp is stale/bogus
+  // (already past the reset, or in the future beyond a full window).
+  if (elapsed <= durationSeconds * PACE_MIN_ELAPSED_FRACTION) return blank;
+  if (elapsed >= durationSeconds) return blank;
+
+  // on_pace% is what the meter WOULD read right now for a perfectly linear
+  // burn that lands exactly on 100% at reset. Comparing the two numbers by eye
+  // is the whole point of showing both.
+  const onPace = (elapsed / durationSeconds) * 100;
+
+  // Where this rate lands at reset.
+  const projected = used <= 0 ? 0 : (used * durationSeconds) / elapsed;
+
+  if (projected < PACE_SLOW_PROJECTED) {
+    // Under-consuming: the limit will not be reached, so there is no
+    // exhaustion time to project.
+    return { onPace, arrow: green(ASCII_ARROWS ? 'v' : '↓') };
+  }
+
+  // Both the on-pace and burning-fast branches project an exhaustion clock.
+  // used > 0 is guaranteed here: projected >= 85 with a positive elapsed can
+  // only happen for a positive used.
+  const exhaustAt = start + elapsed * (100 / used);
+  const eta = clock(exhaustAt);
+
+  // The exhaustion time is coloured by how much of the REMAINING window it
+  // eats: under a third left is alarming, under two thirds is worth noticing.
+  const minutesToExhaust = (exhaustAt - nowSeconds) / 60;
+  const minutesToReset = (resets - nowSeconds) / 60;
+  let timeColor = green;
+  if (minutesToReset > 0) {
+    const ratio = (minutesToExhaust / minutesToReset) * 100;
+    if (ratio < 33) timeColor = red;
+    else if (ratio < 66) timeColor = orange;
+  }
+
+  const head = projected > PACE_FAST_PROJECTED
+    ? red(ASCII_ARROWS ? '^' : '↑')
+    : yellow(ASCII_ARROWS ? '=' : '→');
+
+  return { onPace, arrow: head + (eta ? ' ' + timeColor(eta) : '') };
+}
+
+/**
+ * Seconds -> compact duration. The reference caps at hours, which produces
+ * "142h" for a fresh 7-day window; days keep the 7d cell readable.
+ */
+function untilReset(resetsAt, nowSeconds) {
+  const resets = num(resetsAt);
+  if (resets === null) return '';
+  const seconds = resets - nowSeconds;
+  if (seconds <= 0) return '';
+  const minutes = Math.floor(seconds / 60);
+  if (minutes >= 2880) return `${Math.floor(minutes / 1440)}d`;   // 48h+
+  if (minutes > 99) return `${Math.floor(minutes / 60)}h`;
+  return `${minutes}m`;
+}
+
+/* ---------------------------------------------------------------------------
+ * Line builders
+ * ------------------------------------------------------------------------ */
+
+/** xhigh -> "XHigh"; anything else -> first letter capitalised. */
+function formatEffort(level) {
+  if (typeof level !== 'string' || !level.trim()) return '';
+  const l = level.trim().toLowerCase();
+  const special = { xhigh: 'XHigh', max: 'Max' };
+  return special[l] || l.charAt(0).toUpperCase() + l.slice(1);
+}
+
+/**
+ * Line 1: Model Effort (context variant) Thinking [FAST] [CAVEMAN:X]
+ *         [PONYTAIL:Y] session-name
+ *
+ * The required elements keep their specified relative order. FAST sits with the
+ * other mode flags; the session name is appended last because it is the longest
+ * and the first thing worth losing on a narrow terminal.
+ */
+function lineModel(d, maxWidth) {
+  const model = d?.model?.display_name;
+  const modelText = typeof model === 'string' && model.trim() ? model.trim() : 'Claude';
+
+  // Only annotate the extended window, and only when the display name hasn't
+  // already said so -- "Opus 5 (1M context)" must not become "... (1M context)
+  // (1M context)".
+  const windowSize = num(d?.context_window?.context_window_size);
+  const showVariant = windowSize === 1000000 && !/1M/i.test(String(model ?? ''));
+
+  // Tags are omitted entirely when inactive -- no empty brackets.
+  const caveman = detectPlugin('caveman', 'CAVEMAN_DEFAULT_MODE');
+  const ponytail = detectPlugin('ponytail', 'PONYTAIL_DEFAULT_MODE');
+
+  // fast_mode changes throughput and therefore how fast the 5h window burns.
+  // Strictly boolean-true: an absent field must not read as "off" styling.
+  const fast = d?.fast_mode === true;
+
+  return fit([
+    cell(bold(modelText), 0),
+    cell(formatEffort(d?.effort?.level) && cyan(formatEffort(d.effort.level)), 3),
+    cell(showVariant ? dim('(1M context)') : '', 5),
+    cell(d?.thinking?.enabled === true ? cyan('Thinking') : '', 4),
+    cell(fast ? yellow('[FAST]') : '', 3),
+    cell(caveman ? orange(`[CAVEMAN:${caveman}]`) : '', 2),
+    cell(ponytail ? sage(`[PONYTAIL:${ponytail}]`) : '', 2),
+  ], ' ', maxWidth);
+}
+
+/* Glyphs used by the repo line. CC_STATUSLINE_ASCII swaps in plain text for
+ * consoles whose font boxes them. */
+const GLYPH = ASCII_ARROWS
+  ? { branch: 'br', clean: 'ok', ahead: '^', behind: 'v' }
+  : { branch: '⎇', clean: '✓', ahead: '⇡', behind: '⇣' };
+
+/**
+ * Line 1: repo - branch and working-tree state - session name
+ *
+ * Symbols follow the reference: a tick when clean, otherwise +N staged,
+ * ~N modified, ?N untracked; then unpushed / available-to-pull counts.
+ */
+function lineRepo(d, nowSeconds, maxWidth) {
+  // workspace.repo.name is parsed host-side from the origin remote, so it costs
+  // nothing here. It is absent outside a repo or when there is no origin --
+  // fall back to the project directory's own name.
+  const dir = d?.workspace?.project_dir || d?.workspace?.current_dir || d?.cwd || '';
+  const repoName = d?.workspace?.repo?.name || (dir ? path.basename(dir) : '');
+
+  let gitText = '';
+  const cwd = d?.workspace?.current_dir || d?.cwd || dir;
+  if (GIT_ENABLED && cwd) {
+    const st = gitStatus(cwd);
+    if (st && st.branch) {
+      const parts = [dim(GLYPH.branch) + ' ' + magenta(st.branch)];
+
+      if (!st.staged && !st.modified && !st.untracked) {
+        parts.push(dim(green(GLYPH.clean)));
+      } else {
+        if (st.staged) parts.push(green(`+${st.staged}`));
+        if (st.modified) parts.push(yellow(`~${st.modified}`));
+        if (st.untracked) parts.push(dim(`?${st.untracked}`));
+      }
+
+      if (st.ahead) parts.push(orange(GLYPH.ahead + st.ahead));
+      if (st.behind) parts.push(cyan(GLYPH.behind + st.behind));
+
+      gitText = parts.join(' ');
+
+      // Ahead/behind are only as fresh as the last fetch. Refresh in the
+      // background so the numbers keep meaning something, without ever
+      // blocking this render.
+      if (!st.detached) {
+        const root = findRepoRoot(cwd);
+        if (root) maybeBackgroundFetch(root, st.branch, nowSeconds);
+      }
+    }
+  }
+
+  // Session name, unclipped per spec. Control bytes are still stripped: the
+  // value is AI-generated or user-supplied and reaches a terminal on every
+  // keystroke.
+  const rawName = d?.session_name;
+  const sessionName =
+    typeof rawName === 'string' && rawName.trim()
+      ? rawName.trim().replace(/[\u0000-\u001f\u007f]/g, '')
+      : '';
+
+  // workspace.git_worktree is present for ANY linked worktree created with
+  // `git worktree add`, and absent in the main working tree -- so it only ever
+  // appears when it is actually telling you something. It is deliberately not
+  // read from worktree.name, which is populated only for --worktree sessions
+  // and would miss hand-made worktrees entirely.
+  const rawTree = d?.workspace?.git_worktree;
+  const worktree =
+    typeof rawTree === 'string' && rawTree.trim()
+      ? rawTree.trim().replace(/[\u0000-\u001f\u007f]/g, '')
+      : '';
+
+  return fit([
+    cell(repoName ? cyan(repoName) : '', 0),
+    cell(gitText, 1),
+    // Ranked above the session name: which worktree you are in changes what
+    // your edits affect, and losing that to truncation is a real hazard.
+    cell(worktree ? magenta(`[${worktree}]`) : '', 2),
+    cell(sessionName ? dim(sessionName) : '', 3),
+  ], SEP, maxWidth);
+}
+
+/**
+ * Line 3: S session · D day · W week · M month · burn rate · API share
+ *
+ * Burn rate divides by API time, not wall time: wall-clock $/hr is dominated by
+ * however long you spent reading the diff and says nothing about spend. The API
+ * share (api/wall) is the complement -- how much of the session was actually
+ * inference rather than you thinking.
+ */
+function lineCost(d, t, maxWidth) {
+  // Four bare dollar amounts in a row are unreadable -- nothing says which
+  // window each belongs to. Single-letter keys cost 2 columns each and remove
+  // the ambiguity entirely.
+  const label = (text, value) => (SHOW_COST_LABELS ? `${dim(text)} ${value}` : value);
+
+  const apiMs = num(d?.cost?.total_api_duration_ms);
+  const wallMs = num(d?.cost?.total_duration_ms);
+
+  let burn = '';
+  if (apiMs !== null && apiMs > 0 && t.session > 0) {
+    const perHour = t.session / (apiMs / 3600000);
+    // Above ~$1k/hr the figure is a sampling artifact of a very short session,
+    // not information. Suppress rather than print something absurd.
+    if (perHour < 1000) burn = dim(money(perHour) + '/hr');
+  }
+
+  let apiShare = '';
+  if (apiMs !== null && wallMs !== null && wallMs > 0) {
+    const pct = Math.min(100, (apiMs / wallMs) * 100);
+    apiShare = `${dim('API')} ${dim(Math.round(pct) + '%')}`;
+  }
+
+  return fit([
+    cell(label('S', green(money(t.session))), 0),
+    cell(label('D', money(t.day)), 2),
+    cell(label('W', money(t.week)), 3),
+    cell(label('M', money(t.month)), 4),
+    cell(burn, 5),
+    cell(apiShare, 6),
+  ], SEP, maxWidth);
+}
+
+/**
+ * One rate-limit cell: `5h 71%:60%↑ 16:20:1h`
+ *                          |    |  |     |  `- time until the window resets
+ *                          |    |  `- projected exhaustion clock
+ *                          |    `- on_pace%: what a perfectly linear burn reads
+ *                          `- used%
+ *
+ * @param usedColor colour applied to used% -- threshold-based for 5h, flat for
+ *                  7d, matching the reference.
+ */
+function rateLimitCell(label, node, duration, nowSeconds, usedColor) {
+  const used = num(node?.used_percentage);
+  if (used === null) return `${dim(label)} ${dim('n/a')}`;
+
+  const { onPace, arrow } = paceArrow(used, node?.resets_at, duration, nowSeconds);
+
+  let text = usedColor(`${Math.round(used)}%`);
+  // on_pace% and the arrow are suppressed together: both are undefined in the
+  // opening 2% of a window, and half the trio would read as a bug.
+  if (onPace !== null) text += dim(':') + dim(`${Math.round(onPace)}%`) + arrow;
+
+  const left = untilReset(node?.resets_at, nowSeconds);
+  if (left) text += dim(':') + cyan(left);
+
+  return `${dim(label)} ${text}`;
+}
+
+/** Usage colour for the 5h window. Reference thresholds. */
+function fiveHourColor(p) {
+  if (p >= 80) return red;
+  if (p >= 50) return yellow;
+  return cyan;
+}
+
+/**
+ * Line 2: context usage, LONGCTX flag, token split, cache hit rate, then the
+ * 5h and 7d rate limits with their pace arrows.
+ *
+ * Context and rate limits share a line because they answer the same question --
+ * "how much runway is left" -- and merging them into one fit() call means the
+ * width budget is allocated across all of it at once. Two separate lines would
+ * each trim in isolation and could drop a rate limit while keeping a token
+ * count that nobody needs.
+ */
+function lineUsage(d, ledger, nowSeconds, maxWidth) {
+  const cw = d?.context_window;
+
+  const usedPct = num(cw?.used_percentage) ?? 0;
+  const ctx = `${dim('Ctx')} ${pctColor(usedPct)(`${Math.round(usedPct)}%`)}`;
+
+  // Token counts come from the COMBINED totals, not current_usage.
+  //
+  // current_usage.input_tokens is fresh, uncached input only -- on a warm
+  // session that is a single-digit number ("In 2") while the context actually
+  // holds tens of thousands of tokens, which reads as broken. total_input_tokens
+  // is the sum of input + cache_creation + cache_read, i.e. what is really in
+  // the window. current_usage is still used below for the cache split, which is
+  // the one thing it is genuinely the right source for.
+  const usage = cw?.current_usage;
+  const inTok =
+    num(cw?.total_input_tokens) ??
+    (num(usage?.input_tokens) ?? 0) +
+      (num(usage?.cache_creation_input_tokens) ?? 0) +
+      (num(usage?.cache_read_input_tokens) ?? 0);
+
+  // Out is the session's CUMULATIVE output, accumulated from the transcript.
+  // Neither payload field can supply this: total_output_tokens and
+  // current_usage.output_tokens are both the most recent response only, so Out
+  // would sit at a few hundred all session while In climbed into six figures.
+  // Falls back to the payload when the transcript is unreadable.
+  const tok = ledger?.tokens;
+  const outTok = num(tok?.out) ?? num(cw?.total_output_tokens) ?? num(usage?.output_tokens) ?? 0;
+  const tokens = `${dim('In')} ${group(inTok)} ${dim('Out')} ${group(outTok)}`;
+
+  // cache_read / (input + cache_creation + cache_read). Denominator 0 -> 0%.
+  //
+  // Summed across the whole session, not just the last call, so it sits in the
+  // same frame of reference as Out. The per-call figure swings wildly -- a
+  // single cache-write turn can read 92% where the session is running at 98% --
+  // and the session number is the one that says whether the conversation is
+  // caching well. Falls back to the last call when the transcript is
+  // unreadable.
+  const cacheRead = num(tok?.cacheRead) ?? num(usage?.cache_read_input_tokens) ?? 0;
+  const cacheCreate = num(tok?.cacheCreate) ?? num(usage?.cache_creation_input_tokens) ?? 0;
+  const freshIn = num(tok?.input) ?? num(usage?.input_tokens) ?? 0;
+  const denom = freshIn + cacheCreate + cacheRead;
+  const hit = denom > 0 ? (cacheRead / denom) * 100 : 0;
+  // Inverted scale: a HIGH cache hit rate is the good outcome.
+  const hitColor = hit >= 80 ? green : hit >= 50 ? cyan : orange;
+  const cache = `${dim('Cache')} ${hitColor(`${Math.round(hit)}%`)}`;
+
+  // LngCtx: progress toward the FIXED 200k long-context threshold, which is
+  // fixed regardless of the actual window size. On a 1M model it is reached at
+  // ~20% context -- long before the Ctx cell looks remotely alarming -- and
+  // crossing it moves requests into the premium tier and accelerates
+  // rate-limit burn. Showing it as a percentage rather than a boolean flag
+  // means the approach is visible, not just the arrival.
+  // Deliberately NOT the cumulative Out above: exceeds_200k_tokens is defined
+  // against a single response ("input, cache and output tokens combined, from
+  // the most recent API response"), so the output half must be that response's
+  // output, not the session's running total. Mixing the two inflates the gauge
+  // past 100% on any long session regardless of actual request size.
+  const lastOutTok = num(cw?.total_output_tokens) ?? num(usage?.output_tokens) ?? 0;
+  const longPct = ((inTok + lastOutTok) / 200000) * 100;
+  // exceeds_200k_tokens is authoritative for the crossing itself: it is
+  // computed host-side from the same response, so trust it over our arithmetic
+  // when the two disagree at the boundary.
+  const overLong = d?.exceeds_200k_tokens === true;
+  const longColor = overLong || longPct >= 100 ? red : longPct >= 80 ? orange : longPct >= 50 ? yellow : green;
+  // Once the threshold is actually crossed the label goes red too, not just
+  // the number -- at that point it is a billing-tier change, not a gauge, and
+  // a dim label beside a red figure reads as ordinary.
+  const longLabel = overLong ? red('LngCtx') : dim('LngCtx');
+  const longCtx = `${longLabel} ${longColor(`${Math.round(longPct)}%`)}`;
+
+  const rl = d?.rate_limits;
+
+  return fit([
+    cell(ctx, 0),
+    cell(tokens, 4),
+    cell(cache, 3),
+    cell(longCtx, 2),
+    // Rank 1: on a Max plan the rate-limit windows are the binding constraint,
+    // so they outlive the token counts, the cache rate and LngCtx.
+    cell(rateLimitCell('5h', rl?.five_hour, FIVE_HOUR_SECONDS, nowSeconds, fiveHourColor(num(rl?.five_hour?.used_percentage) ?? 0)), 1),
+    cell(rateLimitCell('7d', rl?.seven_day, SEVEN_DAY_SECONDS, nowSeconds, cyan), 1),
+  ], SEP, maxWidth);
+}
+
+/* ---------------------------------------------------------------------------
+ * Main
+ * ------------------------------------------------------------------------ */
+
+function main() {
+  let data = {};
+  try {
+    const raw = readStdin();
+    if (raw && raw.trim()) {
+      const parsed = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object') data = parsed;
+    }
+  } catch {
+    // Malformed or truncated payload (Claude Code kills in-flight renders).
+    // Keep going with {} -- every builder tolerates a fully empty object.
+  }
+
+  const nowSeconds = Math.floor(Date.now() / 1000);
+  const width = terminalWidth();
+  const lines = [];
+
+  // Each line is independently guarded: one bad field can't blank the others.
+  const safe = (fn, fallback) => {
+    try { return fn(); } catch { return fallback; }
+  };
+
+  // Order: identity, runway (context + rate limits), money, place.
+  // The repo line sits at the bottom because it is the slowest-changing
+  // information on the bar -- branch and working-tree state barely move within
+  // a turn, while context and rate limits move on every response.
+  // One ledger round-trip per render, shared by the two lines that need it.
+  // It carries both the cost roll-ups and the accumulated token totals.
+  const ledger = safe(
+    () => updateLedger(data?.session_id, data?.cost?.total_cost_usd, data?.transcript_path),
+    { session: 0, day: 0, week: 0, month: 0, tokens: null }
+  );
+
+  lines.push(safe(() => lineModel(data, width), 'Claude'));
+  lines.push(safe(() => lineUsage(data, ledger, nowSeconds, width), `${dim('Ctx')} 0%`));
+  lines.push(safe(() => lineCost(data, ledger, width), money(num(data?.cost?.total_cost_usd) ?? 0)));
+  lines.push(safe(() => lineRepo(data, nowSeconds, width), ''));
+
+  const agentName = data?.agent?.name;
+  if (typeof agentName === 'string' && agentName.trim()) {
+    const clean = agentName.replace(/[\u0000-\u001f\u007f]/g, '').trim();
+    if (clean) {
+      const label = dim('Subagent Active:');
+      // Reserve room for the label + its trailing space when clipping.
+      const room = width === null ? 64 : Math.max(8, width - visibleWidth(label) - 1);
+      lines.push(`${label} ${cyan(clip(clean, room))}`);
+    }
+  }
+
+  // A line that produced nothing at all (no repo, no branch, no session name)
+  // is dropped rather than printed blank -- an empty row still costs a terminal
+  // row and looks like a rendering fault.
+  const printable = lines.filter((l) => l !== '');
+  process.stdout.write(printable.join('\n') + '\n');
+}
+
+try {
+  main();
+} catch {
+  // Absolute last resort: never leave the status bar empty and never exit
+  // non-zero, which would make Claude Code log an error on every render.
+  try { process.stdout.write('Claude\n'); } catch { /* stdout is gone */ }
+}

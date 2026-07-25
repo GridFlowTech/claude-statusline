@@ -1,0 +1,19 @@
+# The cost ledger is per-machine runtime state, never source.
+cost_ledger.json
+
+# Backups written by the install/uninstall commands.
+*.bak
+*.bak-*
+settings.json
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Nothing here needs npm, but keep an accidental install out of the tree.
+node_modules/
+package-lock.json
+npm-debug.log*

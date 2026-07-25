@@ -1,0 +1,52 @@
+{
+  "columns": 90,
+  "session_id": "e7b47fc8-b328-42cc-96c1-ff341f7944d8",
+  "transcript_path": "examples/transcript.jsonl",
+  "tasks": [
+    {
+      "id": "t1",
+      "name": "cavecrew-investigator",
+      "type": "general-purpose",
+      "status": "running",
+      "description": "Locate every call site of updateLedger across the repo and report file:line",
+      "label": "grepping src/",
+      "startTime": 1784970000000,
+      "model": "claude-opus-5",
+      "effort": "xhigh",
+      "contextWindowSize": 1000000,
+      "tokenCount": 42100,
+      "cwd": "/home/you/code/my-project"
+    },
+    {
+      "id": "t2",
+      "name": "code-reviewer",
+      "type": "code-reviewer",
+      "status": "running",
+      "description": "Review the diff on branch main",
+      "startTime": 1784970090000,
+      "model": "claude-haiku-4-5-20251001",
+      "effort": "medium",
+      "contextWindowSize": 200000,
+      "tokenCount": 181000,
+      "cwd": "/home/you/code/my-project"
+    },
+    {
+      "id": "t3",
+      "name": "doc-writer",
+      "type": "general-purpose",
+      "status": "completed",
+      "description": "Write the README",
+      "startTime": 1784966400000,
+      "model": "claude-sonnet-5",
+      "contextWindowSize": 200000,
+      "tokenCount": 25000
+    },
+    {
+      "id": "t4",
+      "name": "flaky",
+      "status": "failed",
+      "description": "Broken task",
+      "model": "unknown-model-id"
+    }
+  ]
+}

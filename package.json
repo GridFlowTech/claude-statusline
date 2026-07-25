@@ -1,0 +1,28 @@
+{
+  "name": "claude-statusline",
+  "version": "1.0.0",
+  "description": "Node.js status line and subagent status line for Claude Code. Context runway, rate-limit pace arrows, a persistent cost ledger, and git state. No dependencies.",
+  "license": "MIT",
+  "author": "Mike (Monty) Montandon",
+  "private": true,
+  "engines": {
+    "node": ">=14.17"
+  },
+  "scripts": {
+    "check": "node --check statusline.js && node --check subagent-statusline.js",
+    "test": "node test/run.js",
+    "demo": "node test/demo.js"
+  },
+  "files": [
+    "statusline.js",
+    "subagent-statusline.js"
+  ],
+  "keywords": [
+    "claude",
+    "claude-code",
+    "statusline",
+    "subagent",
+    "rate-limits",
+    "cost-tracking"
+  ]
+}
