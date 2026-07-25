@@ -1,0 +1,13 @@
+# Keep working copies LF on every platform.
+#
+# Not cosmetic here: the scripts assert that they contain no raw control bytes,
+# and the transcript reader tracks byte offsets into a JSONL file. Letting
+# core.autocrlf rewrite line endings on checkout would change byte counts and
+# muddy diffs on the one class of bug this codebase is least able to see.
+* text=auto eol=lf
+
+*.js    text eol=lf
+*.json  text eol=lf
+*.jsonl text eol=lf
+*.md    text eol=lf
+LICENSE text eol=lf
