@@ -3,14 +3,14 @@
 Mock stdin payloads for driving the scripts by hand. Run them from the **repo
 root**, because `transcript_path` is relative:
 
-```
+```bash
 node statusline.js          < examples/payload.json
 node statusline.js          < examples/payload-minimal.json
 node subagent-statusline.js < examples/subagent-payload.json
 ```
 
 | File | What it exercises |
-|---|---|
+| --- | --- |
 | `payload.json` | Everything populated: 1M context, effort, thinking, fast mode, worktree, both rate limits, a named agent |
 | `payload-minimal.json` | The null cases — `current_usage: null`, `rate_limits: null`, null percentages, no `effort`, no `workspace` |
 | `subagent-payload.json` | Four agent-panel rows: two running, one completed, one failed with an unrecognised model id |
@@ -30,7 +30,7 @@ response lands in a real transcript, every copy carrying the same `usage`
 object.
 
 | | Output | Fresh input | Cache creation | Cache read |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | Naive sum over all records | 1350 | 14 | 3500 | 4000 |
 | Deduped by message id | **750** | **8** | **1500** | **2500** |
 
