@@ -103,6 +103,24 @@ for (const { title, payload } of scenarios) {
   console.log(render(MAIN, payload));
 }
 
+/* --- billed plans ------------------------------------------------------- */
+
+const api = JSON.parse(fs.readFileSync(path.join(ROOT, 'examples', 'payload-api.json'), 'utf8'));
+api.transcript_path = path.join(ROOT, 'examples', 'transcript.jsonl');
+
+heading('Billed plan (API key / Bedrock / Vertex / Enterprise), no budget set');
+console.log(render(MAIN, { ...api, session_id: 'demo-api' }));
+
+heading('Billed plan with CC_STATUSLINE_BUDGET=250');
+console.log(render(MAIN, { ...api, session_id: 'demo-budget' }, { CC_STATUSLINE_BUDGET: '250' }));
+
+heading('Billed plan, Console billing period (CC_STATUSLINE_BUDGET_RESET=17:00)');
+console.log(render(MAIN, { ...api, session_id: 'demo-budget-reset' }, {
+  CC_STATUSLINE_BUDGET: '250',
+  CC_STATUSLINE_BUDGET_RESET: '17:00',
+  CC_STATUSLINE_BUDGET_OFFSET: '180.40',
+}));
+
 heading('Width adaptation (same payload, narrowing terminal)');
 for (const cols of [120, 96, 74, 56, 38]) {
   console.log(`\u001b[2mCOLUMNS=${cols}\u001b[0m`);

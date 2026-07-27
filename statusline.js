@@ -92,6 +92,51 @@ const PACE_FAST_PROJECTED = 115;
 const PACE_SLOW_PROJECTED = 85;
 
 /* ---------------------------------------------------------------------------
+ * Budget. API keys, Bedrock, Vertex and Enterprise deployments are billed, not
+ * rate-limited, so the host never sends `rate_limits` for them and the 5h/7d
+ * cells have nothing to show. Configure a dollar allocation and those two slots
+ * become a spend gauge against it instead. All optional; unset means the cell
+ * simply collapses.
+ *
+ *   CC_STATUSLINE_BUDGET=250            the allocation, in dollars
+ *   CC_STATUSLINE_BUDGET_PERIOD=month   day | week | month   (default month)
+ *   CC_STATUSLINE_BUDGET_RESET=17:00    local time of day the period rolls over
+ *   CC_STATUSLINE_BUDGET_OFFSET=12.40   spend that predates the local ledger
+ * ------------------------------------------------------------------------ */
+
+// Parsed once here rather than per render: none of it can change without a new
+// process, and every render pays for anything left in the hot path.
+const BUDGET_TOTAL = (() => {
+  const n = Number(process.env.CC_STATUSLINE_BUDGET);
+  return Number.isFinite(n) && n > 0 ? n : null;
+})();
+
+const BUDGET_PERIOD = /^(day|week|month)$/.test(process.env.CC_STATUSLINE_BUDGET_PERIOD || '')
+  ? process.env.CC_STATUSLINE_BUDGET_PERIOD
+  : 'month';
+
+// [hour, minute], or null for the plain calendar boundary (midnight).
+//
+// With a reset time set, a `month` period closes on the LAST DAY of the month
+// at that time -- not on the 1st -- because that is where the Console billing
+// period actually ends. `day` and `week` close at that time on the day itself.
+const BUDGET_RESET = (() => {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(process.env.CC_STATUSLINE_BUDGET_RESET || '');
+  if (!m) return null;
+  const h = Number(m[1]);
+  const min = Number(m[2]);
+  return h < 24 && min < 60 ? [h, min] : null;
+})();
+
+// The local ledger only knows the sessions it saw. Installed mid-period, or
+// billed for work done on another machine, it under-reports -- this adds the
+// missing dollars back so the gauge lines up with the Console.
+const BUDGET_OFFSET = (() => {
+  const n = Number(process.env.CC_STATUSLINE_BUDGET_OFFSET);
+  return Number.isFinite(n) && n > 0 ? n : 0;
+})();
+
+/* ---------------------------------------------------------------------------
  * Git. One subprocess per render, and only when we are actually inside a repo.
  * ------------------------------------------------------------------------ */
 
@@ -673,8 +718,57 @@ function saveLedger(file, data) {
 
 /**
  * Record this render's session cost and roll up the historical buckets.
- * @returns {{session:number, day:number, week:number, month:number}}
+ * @returns {{session:number, day:number, week:number, month:number,
+ *            period:number|null, periodEnd:number|null}}
  */
+/**
+ * The budget period containing `nowMs`, as `{ start, end }` epoch milliseconds.
+ * null when no budget is configured -- the roll-up below skips the extra pass.
+ *
+ * Boundaries are built from local date COMPONENTS, never from arithmetic on a
+ * timestamp, so a DST shift inside the period cannot slide the edges by an
+ * hour. Indexing the boundary function means start and end always come from
+ * the same series and cannot disagree about which period we are in.
+ */
+function budgetWindow(nowMs) {
+  if (BUDGET_TOTAL === null) return null;
+
+  const now = new Date(nowMs);
+  const h = BUDGET_RESET ? BUDGET_RESET[0] : 0;
+  const min = BUDGET_RESET ? BUDGET_RESET[1] : 0;
+
+  if (BUDGET_PERIOD === 'month') {
+    // closeAt(i) ends the month at index i (years * 12 + month). Default: the
+    // 1st of the next month at midnight. With a reset time: the last day of
+    // this month at that time, which is `day 0` of the next month.
+    const dayOfNext = BUDGET_RESET ? 0 : 1;
+    const closeAt = (i) => new Date(Math.floor(i / 12), (i % 12) + 1, dayOfNext, h, min, 0, 0).getTime();
+    let i = now.getFullYear() * 12 + now.getMonth();
+    if (nowMs >= closeAt(i)) i += 1;
+    return { start: closeAt(i - 1), end: closeAt(i) };
+  }
+
+  // day and week both close at `h:min` on some day, so one day-indexed
+  // boundary function covers them. Date normalises an out-of-range day.
+  const y = now.getFullYear();
+  const mo = now.getMonth();
+  const closeAt = (day) => new Date(y, mo, day, h, min, 0, 0).getTime();
+  const span = BUDGET_PERIOD === 'week' ? 7 : 1;
+
+  let end = closeAt(now.getDate());
+  if (BUDGET_PERIOD === 'week') {
+    // Weeks roll over on Monday. getDay() is Sunday-based; shift so 0 = Monday.
+    const sinceMonday = (now.getDay() + 6) % 7;
+    end = closeAt(now.getDate() - sinceMonday + (sinceMonday === 0 && nowMs < end ? 0 : 7));
+  } else if (nowMs >= end) {
+    end = closeAt(now.getDate() + 1);
+  }
+
+  const endDate = new Date(end);
+  const start = new Date(endDate.getFullYear(), endDate.getMonth(), endDate.getDate() - span, h, min, 0, 0).getTime();
+  return { start, end };
+}
+
 function updateLedger(sessionId, sessionCost, transcriptPath) {
   // The id becomes a plain-object key. Refuse anything that could collide with
   // Object.prototype ("__proto__", "constructor") or smuggle odd characters --
@@ -684,7 +778,7 @@ function updateLedger(sessionId, sessionCost, transcriptPath) {
     sessionId = '';
   }
   const cost = num(sessionCost) ?? 0;
-  const totals = { session: cost, day: cost, week: cost, month: cost, tokens: null };
+  const totals = { session: cost, day: cost, week: cost, month: cost, tokens: null, period: null, periodEnd: null };
 
   let file;
   try { file = ledgerPath(); } catch { return totals; }
@@ -740,6 +834,16 @@ function updateLedger(sessionId, sessionCost, transcriptPath) {
   const startOfWeek = startOfToday - 6 * 86400000;                      // today + previous 6 days
   const startOfMonth = new Date(d.getFullYear(), d.getMonth(), 1).getTime();
 
+  // The budget period is a separate window from the D/W/M buckets: it can end
+  // at 17:00 on the last day of the month rather than at a calendar boundary,
+  // so it needs its own start and its own bounded end. Folded into the same
+  // pass -- a second walk of the store per render buys nothing.
+  const win = budgetWindow(now);
+  if (win) {
+    totals.period = BUDGET_OFFSET;
+    totals.periodEnd = win.end;
+  }
+
   totals.day = 0;
   totals.week = 0;
   totals.month = 0;
@@ -750,6 +854,7 @@ function updateLedger(sessionId, sessionCost, transcriptPath) {
     if (anchor >= startOfToday) totals.day += c;
     if (anchor >= startOfWeek) totals.week += c;
     if (anchor >= startOfMonth) totals.month += c;
+    if (win && anchor >= win.start && anchor < win.end) totals.period += c;
   }
 
   // A brand-new session that hasn't been flushed yet must still appear in the
@@ -758,6 +863,7 @@ function updateLedger(sessionId, sessionCost, transcriptPath) {
     totals.day += cost;
     totals.week += cost;
     totals.month += cost;
+    if (win) totals.period += cost;
   }
 
   if (dirty) saveLedger(file, store);
@@ -837,16 +943,20 @@ function paceArrow(usedPct, resetsAt, durationSeconds, nowSeconds) {
 /**
  * Seconds -> compact duration. The reference caps at hours, which produces
  * "142h" for a fresh 7-day window; days keep the 7d cell readable.
+ * Non-positive (already elapsed, or a bogus stamp) renders as nothing at all.
  */
-function untilReset(resetsAt, nowSeconds) {
-  const resets = num(resetsAt);
-  if (resets === null) return '';
-  const seconds = resets - nowSeconds;
-  if (seconds <= 0) return '';
+function fmtSpan(seconds) {
+  if (!(seconds > 0)) return '';
   const minutes = Math.floor(seconds / 60);
   if (minutes >= 2880) return `${Math.floor(minutes / 1440)}d`;   // 48h+
   if (minutes > 99) return `${Math.floor(minutes / 60)}h`;
   return `${minutes}m`;
+}
+
+function untilReset(resetsAt, nowSeconds) {
+  const resets = num(resetsAt);
+  if (resets === null) return '';
+  return fmtSpan(resets - nowSeconds);
 }
 
 /* ---------------------------------------------------------------------------
@@ -988,6 +1098,20 @@ function lineRepo(d, nowSeconds, maxWidth) {
  * share (api/wall) is the complement -- how much of the session was actually
  * inference rather than you thinking.
  */
+/**
+ * Dollars per hour of API time -- not per hour of wall clock. Idle minutes are
+ * not spend, and including them makes a session that sat untouched overnight
+ * look free. null when there is nothing meaningful to divide.
+ */
+function burnPerHour(d, sessionCost) {
+  const apiMs = num(d?.cost?.total_api_duration_ms);
+  if (apiMs === null || apiMs <= 0 || !(sessionCost > 0)) return null;
+  const perHour = sessionCost / (apiMs / 3600000);
+  // Above ~$1k/hr the figure is a sampling artifact of a very short session,
+  // not information. Suppress rather than report something absurd.
+  return perHour < 1000 ? perHour : null;
+}
+
 function lineCost(d, t, maxWidth) {
   // Four bare dollar amounts in a row are unreadable -- nothing says which
   // window each belongs to. Single-letter keys cost 2 columns each and remove
@@ -997,13 +1121,8 @@ function lineCost(d, t, maxWidth) {
   const apiMs = num(d?.cost?.total_api_duration_ms);
   const wallMs = num(d?.cost?.total_duration_ms);
 
-  let burn = '';
-  if (apiMs !== null && apiMs > 0 && t.session > 0) {
-    const perHour = t.session / (apiMs / 3600000);
-    // Above ~$1k/hr the figure is a sampling artifact of a very short session,
-    // not information. Suppress rather than print something absurd.
-    if (perHour < 1000) burn = dim(money(perHour) + '/hr');
-  }
+  const perHour = burnPerHour(d, t.session);
+  const burn = perHour === null ? '' : dim(money(perHour) + '/hr');
 
   let apiShare = '';
   if (apiMs !== null && wallMs !== null && wallMs > 0) {
@@ -1065,6 +1184,60 @@ function fiveHourColor(p) {
  * each trim in isolation and could drop a rate limit while keeping a token
  * count that nobody needs.
  */
+/**
+ * Spend against the configured allocation: "Bgt $34.63/250:6h".
+ *
+ * The trailing span is the same projection the rate-limit pace arrows make --
+ * at the current burn, when does the allocation run out -- coloured by how much
+ * of the remaining period that eats. Empty when no budget is configured.
+ */
+function budgetCell(t, perHour, nowSeconds) {
+  const spent = num(t?.period);
+  if (BUDGET_TOTAL === null || spent === null) return '';
+
+  const pct = (spent / BUDGET_TOTAL) * 100;
+  const color = pct >= 80 ? red : pct >= 50 ? yellow : cyan;
+
+  // The allocation keeps its own formatting: a round 250 reads better than the
+  // noisier "$250.00" beside an amount that genuinely needs its cents.
+  const cap = Number.isInteger(BUDGET_TOTAL) ? String(BUDGET_TOTAL) : BUDGET_TOTAL.toFixed(2);
+  let text = color(`${money(spent)}/${cap}`);
+
+  const left = BUDGET_TOTAL - spent;
+  if (perHour !== null) {
+    // Nothing left to project once the allocation is gone: the span goes
+    // negative and fmtSpan -- the single authority on non-positive durations --
+    // renders it as nothing at all.
+    const secondsToEmpty = (left / perHour) * 3600;
+    const span = fmtSpan(secondsToEmpty);
+    if (span) {
+      const end = num(t?.periodEnd);
+      const secondsToReset = end === null ? 0 : end / 1000 - nowSeconds;
+      let timeColor = green;
+      if (secondsToReset > 0) {
+        const ratio = (secondsToEmpty / secondsToReset) * 100;
+        if (ratio < 33) timeColor = red;
+        else if (ratio < 66) timeColor = orange;
+      }
+      text += dim(':') + timeColor(span);
+    }
+  }
+
+  return `${dim('Bgt')} ${text}`;
+}
+
+/**
+ * Blended cost per million tokens: what this session actually paid, divided by
+ * everything it was billed for. Per MILLION rather than the reference's per
+ * 1k, because at two decimal places a per-1k figure collapses to "$0.01" or
+ * "$0.02" for every model -- one significant digit, and no way to see a cache
+ * strategy working. Per-million keeps the resolution the number is for.
+ */
+function tokenRateCell(sessionCost, tokens) {
+  if (!(tokens > 0) || !(sessionCost > 0)) return '';
+  return `${dim('$/Mtok')} ${dim(((sessionCost * 1e6) / tokens).toFixed(2))}`;
+}
+
 function lineUsage(d, ledger, nowSeconds, maxWidth) {
   const cw = d?.context_window;
 
@@ -1137,16 +1310,46 @@ function lineUsage(d, ledger, nowSeconds, maxWidth) {
   const longCtx = `${longLabel} ${longColor(`${Math.round(longPct)}%`)}`;
 
   const rl = d?.rate_limits;
+  const hasWindow =
+    num(rl?.five_hour?.used_percentage) !== null || num(rl?.seven_day?.used_percentage) !== null;
+
+  // rate_limits is sent only to Claude.ai subscribers, and only AFTER the first
+  // API response of the session -- so its absence on its own does not mean "API
+  // plan". Wait until a response has actually landed before reading it that
+  // way, or every subscription session opens on the budget cells and flips to
+  // 5h/7d one response later.
+  const sessionCost = num(d?.cost?.total_cost_usd) ?? 0;
+  const responded = inTok > 0 || outTok > 0 || sessionCost > 0;
+  const billed = !hasWindow && responded;
+
+  // Denominator for $/Mtok: session cost has to be divided by everything the
+  // session was billed for, not by what happens to be in the window right now.
+  // The transcript totals are the only cumulative input figure available --
+  // without them, fall back to the context window's own numbers.
+  const lifetimeTokens = num(tok?.input) !== null
+    ? freshIn + cacheCreate + cacheRead + outTok
+    : inTok + outTok;
+
+  // Rank 1 on both plans: whichever of the two is real -- the rate-limit
+  // windows on a subscription, the allocation on a billed account -- is the
+  // constraint that ends the day's work, so it outlives the token counts, the
+  // cache rate and LngCtx.
+  const constraint = billed
+    ? [
+        cell(budgetCell(ledger, burnPerHour(d, sessionCost), nowSeconds), 1),
+        cell(tokenRateCell(sessionCost, lifetimeTokens), 5),
+      ]
+    : [
+        cell(rateLimitCell('5h', rl?.five_hour, FIVE_HOUR_SECONDS, nowSeconds, fiveHourColor(num(rl?.five_hour?.used_percentage) ?? 0)), 1),
+        cell(rateLimitCell('7d', rl?.seven_day, SEVEN_DAY_SECONDS, nowSeconds, cyan), 1),
+      ];
 
   return fit([
     cell(ctx, 0),
     cell(tokens, 4),
     cell(cache, 3),
     cell(longCtx, 2),
-    // Rank 1: on a Max plan the rate-limit windows are the binding constraint,
-    // so they outlive the token counts, the cache rate and LngCtx.
-    cell(rateLimitCell('5h', rl?.five_hour, FIVE_HOUR_SECONDS, nowSeconds, fiveHourColor(num(rl?.five_hour?.used_percentage) ?? 0)), 1),
-    cell(rateLimitCell('7d', rl?.seven_day, SEVEN_DAY_SECONDS, nowSeconds, cyan), 1),
+    ...constraint,
   ], SEP, maxWidth);
 }
 
@@ -1349,7 +1552,7 @@ function main() {
   // It carries both the cost roll-ups and the accumulated token totals.
   const ledger = safe(
     () => updateLedger(data?.session_id, data?.cost?.total_cost_usd, data?.transcript_path),
-    { session: 0, day: 0, week: 0, month: 0, tokens: null }
+    { session: 0, day: 0, week: 0, month: 0, tokens: null, period: null, periodEnd: null }
   );
 
   lines.push(safe(() => lineModel(data, width), 'Claude'));

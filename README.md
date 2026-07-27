@@ -38,7 +38,7 @@ statusline.js             the status line above the footer
 subagent-statusline.js    one row per subagent in the agent panel
 install.js                installer, updater and uninstaller in one file
 examples/                 mock payloads, plus a transcript that proves the dedup
-test/run.js               72 assertions, no framework
+test/run.js               86 assertions, no framework
 test/demo.js              renders every scenario with live timestamps
 ```
 
@@ -47,7 +47,7 @@ throwaway config directory, so neither touches your real ledger or settings:
 
 ```bash
 node test/demo.js     # every scenario, with live pace arrows
-node test/run.js      # 72 passed, 0 failed
+node test/run.js      # 86 passed, 0 failed
 ```
 
 ---
@@ -362,12 +362,23 @@ Ctx 15% · In 152,000 Out 153,470 · Cache 98% · LngCtx 76% · 5h 90%:20%↑ 02
 | `Out`       | **transcript**                      | Session-cumulative output. Not available from the payload - see below. |
 | `Cache n%`  | **transcript**                      | Session-cumulative hit rate. Inverted colour scale - high is good.     |
 | `LngCtx n%` | computed, `exceeds_200k_tokens`     | Progress toward the fixed 200k threshold.                              |
-| `5h`        | `rate_limits.five_hour`             | Threshold-coloured.                                                    |
-| `7d`        | `rate_limits.seven_day`             |                                                                        |
+| `5h`        | `rate_limits.five_hour`             | Threshold-coloured. Subscription plans only.                           |
+| `7d`        | `rate_limits.seven_day`             | Subscription plans only.                                               |
+| `Bgt`       | ledger + `CC_STATUSLINE_BUDGET`     | Billed plans only, and only with a budget set. See below.              |
+| `$/Mtok`    | `cost` + **transcript**             | Billed plans only. Blended cost per million tokens.                    |
 
 Context and rate limits share one line because they answer the same question -
 how much runway is left - and because merging them lets the width budget be
 allocated across all of it at once.
+
+The last two slots hold whichever pair is real. `rate_limits` is sent only to
+Claude.ai subscribers, so on an API key, Bedrock, Vertex or Enterprise
+deployment the windows are replaced by the budget gauge and the blended token
+rate rather than sitting there reading `n/a` forever:
+
+```text
+Ctx 76% · In 152,000 Out 153,470 · Cache 98% · LngCtx 76% · Bgt $24.36/250:11h · $/Mtok 12.83
+```
 
 ### Line 3 - money
 
@@ -614,6 +625,70 @@ Arrows are also suppressed when `resets_at` is stale or implausible - already
 past, or more than a full window in the future.
 
 Window lengths: 5-hour = 18,000 s, 7-day = 604,800 s.
+
+### Budget - API, Bedrock, Vertex and Enterprise
+
+`rate_limits` is sent **only to Claude.ai subscribers**, and even then only after
+the first API response of the session. Billed deployments are metered in dollars
+instead, so the two window cells give way to a spend gauge against an allocation
+you set:
+
+```text
+Bgt $34.63/250:6h
+    |      |   `- time until the allocation runs out at the current burn rate
+    |      `- the allocation
+    `- spend so far this period
+```
+
+**Detection.** Absent `rate_limits` on its own does not mean "billed" - that is
+also what every subscription session looks like before its first response. The
+swap waits until tokens or cost have actually moved, so a subscription session
+never opens on the budget cells and flips to `5h`/`7d` a moment later.
+
+**Spend** comes from the same cost ledger that feeds line 3, summed over the
+sessions whose start falls inside the current period, plus
+`CC_STATUSLINE_BUDGET_OFFSET`. No second store, no extra file read.
+
+**Colours:** cyan under 50% of the allocation, yellow at 50-80, red above 80.
+The trailing span is the same projection the pace arrows make, coloured by how
+much of the remaining period it eats (red under 33%, orange under 66%). It
+disappears once the allocation is spent - there is nothing left to project.
+
+| Variable                        | Default | Meaning                                              |
+| ------------------------------- | ------- | ---------------------------------------------------- |
+| `CC_STATUSLINE_BUDGET`          | unset   | The allocation in dollars. Unset hides the cell.     |
+| `CC_STATUSLINE_BUDGET_PERIOD`   | `month` | `day`, `week` (Monday-anchored) or `month`.          |
+| `CC_STATUSLINE_BUDGET_RESET`    | unset   | `HH:MM` local time the period rolls over.            |
+| `CC_STATUSLINE_BUDGET_OFFSET`   | `0`     | Spend the local ledger never saw.                    |
+
+**`CC_STATUSLINE_BUDGET_RESET` is where the Console's billing period gets
+matched.** Unset, a `month` period runs from the 1st at midnight. Set, a `month`
+period closes on the **last day of the month** at that time - `17:00` gives a
+period ending on the last day at 5pm, which is where Console billing actually
+lands. For `day` and `week` the reset time applies to the boundary day itself.
+
+`CC_STATUSLINE_BUDGET_OFFSET` exists because the ledger only knows the sessions
+it saw: installed mid-period, or billed for work from another machine, it
+under-reports. Read the period-to-date figure off the Console once and set the
+difference.
+
+```bash
+CC_STATUSLINE_BUDGET=250
+CC_STATUSLINE_BUDGET_RESET=17:00
+CC_STATUSLINE_BUDGET_OFFSET=180.40
+```
+
+### `$/Mtok`
+
+Blended cost per million tokens: `total_cost_usd` over every token the session
+was billed for, taken from the transcript's cumulative totals (fresh input,
+cache creation, cache reads and output) and falling back to the context window's
+own numbers when the transcript is unreadable.
+
+Per **million**, not the reference's per 1k: at two decimal places a per-1k
+figure collapses to `$0.01` or `$0.02` for every model on the market - one
+significant digit, and no way to watch a cache strategy pay off. Per-million
+keeps the resolution the number exists for.
 
 ### Token counts
 
@@ -884,6 +959,10 @@ In `subagent-statusline.js`:
 | `CC_STATUSLINE_ASCII=1`   | Replace `↑ → ↓ ⎇ ✓ ⇡ ⇣` with `^ = v br ok ^ v`. Use if your console font boxes them. |
 | `COLUMNS`                 | Set by Claude Code; see below.                                                       |
 | `CLAUDE_CONFIG_DIR`       | Relocates `.claude`, including the ledger and plugin flags.                          |
+| `CC_STATUSLINE_BUDGET`    | Dollar allocation for billed plans. Turns on the `Bgt` cell. [Details](#budget---api-bedrock-vertex-and-enterprise) |
+| `CC_STATUSLINE_BUDGET_PERIOD` | `day`, `week` or `month` (default).                                              |
+| `CC_STATUSLINE_BUDGET_RESET`  | `HH:MM` the budget period rolls over. `17:00` matches Console billing.           |
+| `CC_STATUSLINE_BUDGET_OFFSET` | Period spend the local ledger never saw.                                         |
 
 ---
 
@@ -906,7 +985,10 @@ until the line fits.
 | 3–6  | Dropped first |
 
 Rate limits are ranked 1: on a Max plan the windows are the binding constraint,
-so they outlive token counts, the cache rate and LngCtx.
+so they outlive token counts, the cache rate and LngCtx. `Bgt` inherits that
+rank on billed plans for the same reason - it is the constraint that ends the
+day's work. `$/Mtok` is ranked 5 and goes early; it is a diagnostic, not a
+runway.
 
 Observed degradation:
 
@@ -946,7 +1028,10 @@ Per the official schema, these are the fields that actually go missing:
 - `context_window.current_usage` - **null before the first API call of a
   session, and again after `/compact`** until the next response
 - `context_window.used_percentage`, `remaining_percentage` - may be null early
-- `rate_limits` - entirely absent on API/enterprise billing
+- `rate_limits` - **entirely absent on API/Bedrock/Vertex/Enterprise billing**,
+  and absent on subscriptions until the first API response. Either window may
+  also be missing independently. See
+  [Budget](#budget---api-bedrock-vertex-and-enterprise) for what takes the slot
 - `effort` - absent on models without an effort parameter
 - `session_name`, `agent`, `pr`, `worktree`, `workspace.repo` - absent by
   default
@@ -1029,8 +1114,19 @@ at most once per 600 s per branch. Create `local/` in the repo to opt in, or run
 **Glyphs render as boxes.** Set `CC_STATUSLINE_ASCII=1`, or switch the console
 font to one with full Unicode coverage (Cascadia Mono, Consolas).
 
-**Rate limits show `n/a`.** `rate_limits` is absent on API/enterprise billing,
-and briefly at session start before the first response.
+**Rate limits show `n/a`.** Expected briefly at session start, before the first
+API response - that is the one moment no plan can be told apart from another.
+Once a response lands, a subscription fills the windows in and a billed plan
+swaps them for `Bgt` / `$/Mtok`. `n/a` that never clears means no response has
+come back yet.
+
+**No `Bgt` cell on a billed plan.** `CC_STATUSLINE_BUDGET` is unset, or set to
+something that is not a positive number. `$/Mtok` shows either way.
+
+**`Bgt` disagrees with the Console.** The ledger only counts sessions rendered
+on this machine, and it keeps 45 days of them. Set
+`CC_STATUSLINE_BUDGET_OFFSET` to the difference, and check that
+`CC_STATUSLINE_BUDGET_RESET` matches where your billing period actually closes.
 
 **Rate limits show only `used%` with no `on_pace%` or arrow.** Expected during
 the opening 2% of a window - 6 minutes into a 5-hour window, ~3.4 hours into a
@@ -1150,7 +1246,7 @@ The same trust and `disableAllHooks` gates that apply to `statusLine` apply to
 ## Development
 
 ```bash
-node test/run.js       # 72 assertions across all three scripts
+node test/run.js       # 86 assertions across all three scripts
 node test/demo.js      # render every scenario with live timestamps
 node --check statusline.js && node --check subagent-statusline.js && node --check install.js
 ```

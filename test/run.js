@@ -157,7 +157,19 @@ check('empty stdin exits 0', () => {
 });
 
 check('null current_usage and null rate_limits degrade to n/a', () => {
-  const r = run(MAIN, basePayload({ rate_limits: null }));
+  // Before the first API response, absent rate_limits is what EVERY plan looks
+  // like -- a subscription included -- so the windows stay on screen.
+  const r = run(MAIN, basePayload({
+    rate_limits: null,
+    cost: { total_cost_usd: 0 },
+    context_window: {
+      total_input_tokens: 0,
+      total_output_tokens: 0,
+      context_window_size: 200000,
+      used_percentage: null,
+      current_usage: null,
+    },
+  }));
   assert(r.status === 0, `exit ${r.status}`);
   assertMatch(r.stdout, '5h n/a', 'null rate limits');
   assertMatch(r.stdout, '7d n/a', 'null rate limits');
@@ -255,6 +267,184 @@ check('rate limit renders used:on_pace:reset in that order', () => {
   }));
   assert(/5h 40%:50%\u2193:\d+[mhd]/.test(r.stdout), `bad 5h format: ${r.stdout}`);
   assert(/7d 10%:50%\u2193:\d+[mhd]/.test(r.stdout), `bad 7d format: ${r.stdout}`);
+});
+
+/* --- billed plans: API key, Bedrock, Vertex, Enterprise ------------------ */
+
+const LEDGER = 'cost_ledger.json';
+
+/** A config dir whose ledger already holds `sessions`. */
+function seededSandbox(sessions) {
+  const dir = sandbox();
+  fs.writeFileSync(path.join(dir, LEDGER), JSON.stringify({ v: 1, sessions }), 'utf8');
+  return dir;
+}
+
+check('no rate_limits after a response swaps the windows for billed cells', () => {
+  const r = run(MAIN, basePayload());
+  assertNotMatch(r.stdout, '5h n/a', 'the dead window cells must be gone');
+  assertNotMatch(r.stdout, '7d n/a', 'the dead window cells must be gone');
+  assertMatch(r.stdout, '$/Mtok', 'billed cells');
+});
+
+check('$/Mtok divides session cost by every token billed', () => {
+  // $1.00 over 5000 in + 100 out = $196.08 per million.
+  const r = run(MAIN, basePayload());
+  assertMatch(r.stdout, '$/Mtok 196.08', 'blended rate');
+});
+
+check('$/Mtok uses the cumulative transcript totals, not the live window', () => {
+  // transcript.jsonl deduped: 8 fresh + 1500 created + 2500 read + 750 out = 4758.
+  const r = run(MAIN, basePayload({ transcript_path: TRANSCRIPT }));
+  assertMatch(r.stdout, '$/Mtok 210.17', 'cumulative denominator');
+});
+
+check('no budget configured shows no budget cell', () => {
+  const r = run(MAIN, basePayload());
+  assertNotMatch(r.stdout, 'Bgt', 'no allocation, no gauge');
+});
+
+check('a budget renders period spend against the allocation', () => {
+  const r = run(MAIN, basePayload(), { env: { CC_STATUSLINE_BUDGET: '50' } });
+  assertMatch(r.stdout, 'Bgt $1.00/50', 'budget gauge');
+});
+
+check('the budget offset covers spend the ledger never saw', () => {
+  const r = run(MAIN, basePayload(), {
+    env: { CC_STATUSLINE_BUDGET: '50', CC_STATUSLINE_BUDGET_OFFSET: '9' },
+  });
+  assertMatch(r.stdout, 'Bgt $10.00/50', 'offset added to period spend');
+});
+
+check('the budget period bounds which ledger sessions count', () => {
+  // 25 hours ago is a previous calendar day whatever the clock reads.
+  const then = Date.now() - 25 * 3600000;
+  const seed = { older: { first: then, last: then, cost: 7 } };
+
+  const daily = run(MAIN, basePayload(), {
+    configDir: seededSandbox(seed),
+    env: { CC_STATUSLINE_BUDGET: '50', CC_STATUSLINE_BUDGET_PERIOD: 'day' },
+  });
+  assertMatch(daily.stdout, 'Bgt $1.00/50', "yesterday's spend must not count against today");
+
+  // Same ledger, monthly period: it does count -- unless today is the 1st, when
+  // 25h ago genuinely belongs to the previous month.
+  if (new Date().getDate() > 1) {
+    const monthly = run(MAIN, basePayload(), {
+      configDir: seededSandbox(seed),
+      env: { CC_STATUSLINE_BUDGET: '50' },
+    });
+    assertMatch(monthly.stdout, 'Bgt $8.00/50', 'the same session counts for the month');
+  }
+});
+
+check('a reset time moves the period boundary off midnight', () => {
+  const then = Date.now() - 2 * 3600000;
+  const seed = { earlier: { first: then, last: then, cost: 7 } };
+  const hhmm = (ms) => {
+    const d = new Date(ms);
+    return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+  };
+
+  // Boundary an hour ago: the session from two hours ago is a past period.
+  const after = run(MAIN, basePayload(), {
+    configDir: seededSandbox(seed),
+    env: {
+      CC_STATUSLINE_BUDGET: '50',
+      CC_STATUSLINE_BUDGET_PERIOD: 'day',
+      CC_STATUSLINE_BUDGET_RESET: hhmm(Date.now() - 3600000),
+    },
+  });
+  assertMatch(after.stdout, 'Bgt $1.00/50', 'spend before the reset belongs to the last period');
+
+  // Boundary an hour from now: the same session is still inside this one.
+  const before = run(MAIN, basePayload(), {
+    configDir: seededSandbox(seed),
+    env: {
+      CC_STATUSLINE_BUDGET: '50',
+      CC_STATUSLINE_BUDGET_PERIOD: 'day',
+      CC_STATUSLINE_BUDGET_RESET: hhmm(Date.now() + 3600000),
+    },
+  });
+  assertMatch(before.stdout, 'Bgt $8.00/50', 'spend after the reset is the current period');
+});
+
+check('a week period spans seven days back from the Monday boundary', () => {
+  const now = new Date();
+  // On a Monday, yesterday is genuinely the previous week and proves nothing.
+  if (now.getDay() === 1) return;
+
+  const y = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, 12, 0, 0, 0).getTime();
+  const weekly = run(MAIN, basePayload(), {
+    configDir: seededSandbox({ yesterday: { first: y, last: y, cost: 7 } }),
+    env: { CC_STATUSLINE_BUDGET: '50', CC_STATUSLINE_BUDGET_PERIOD: 'week' },
+  });
+  assertMatch(weekly.stdout, 'Bgt $8.00/50', 'yesterday is inside the current week');
+});
+
+check('a monthly reset time closes on the last day, not the 1st', () => {
+  // 30 seconds before this month began: the last day of the PREVIOUS month, at
+  // 23:59:30. A calendar month period starts after it; a 23:59 reset period
+  // starts 30 seconds before it, so only the reset rule counts it.
+  const now = new Date();
+  const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0).getTime();
+  const anchor = startOfMonth - 30 * 1000;
+  const seed = { lastMonth: { first: anchor, last: anchor, cost: 7 } };
+
+  // The one minute a year this cannot hold: the period has already rolled over.
+  const lastDay = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+  if (now.getDate() === lastDay && now.getHours() === 23 && now.getMinutes() === 59) return;
+
+  const calendar = run(MAIN, basePayload(), {
+    configDir: seededSandbox(seed),
+    env: { CC_STATUSLINE_BUDGET: '50' },
+  });
+  assertMatch(calendar.stdout, 'Bgt $1.00/50', 'a calendar month starts on the 1st');
+
+  const billing = run(MAIN, basePayload(), {
+    configDir: seededSandbox(seed),
+    env: { CC_STATUSLINE_BUDGET: '50', CC_STATUSLINE_BUDGET_RESET: '23:59' },
+  });
+  assertMatch(billing.stdout, 'Bgt $8.00/50', 'a 23:59 reset closes on the last day');
+});
+
+check('the budget projects an exhaustion span from the API burn rate', () => {
+  // $1.00 over an hour of API time is $1/hr; $49 left is 49h -> "2d".
+  const r = run(MAIN, basePayload({
+    cost: { total_cost_usd: 1, total_api_duration_ms: 3600000 },
+  }), { env: { CC_STATUSLINE_BUDGET: '50' } });
+  assertMatch(r.stdout, 'Bgt $1.00/50:2d', 'exhaustion span');
+});
+
+check('an exhausted budget projects nothing', () => {
+  const r = run(MAIN, basePayload({
+    cost: { total_cost_usd: 60, total_api_duration_ms: 3600000 },
+  }), { env: { CC_STATUSLINE_BUDGET: '50' } });
+  assertMatch(r.stdout, 'Bgt $60.00/50', 'over the allocation');
+  assert(!/Bgt \$60\.00\/50:/.test(r.stdout), 'no span once the allocation is gone');
+});
+
+check('a subscription session never shows the budget cell', () => {
+  const r = run(MAIN, basePayload({
+    rate_limits: { five_hour: window_(40, 18000, 0.5), seven_day: window_(10, 604800, 0.5) },
+  }), { env: { CC_STATUSLINE_BUDGET: '50' } });
+  assertMatch(r.stdout, '5h 40%', 'the windows still win');
+  assertNotMatch(r.stdout, 'Bgt', 'no budget gauge on a subscription');
+});
+
+check('malformed budget env vars are ignored, not fatal', () => {
+  for (const v of ['abc', '0', '-5', '']) {
+    const r = run(MAIN, basePayload(), {
+      env: {
+        CC_STATUSLINE_BUDGET: v,
+        CC_STATUSLINE_BUDGET_PERIOD: 'fortnight',
+        CC_STATUSLINE_BUDGET_RESET: 'half past',
+        CC_STATUSLINE_BUDGET_OFFSET: 'lots',
+      },
+    });
+    assert(r.status === 0, `CC_STATUSLINE_BUDGET=${JSON.stringify(v)} exit ${r.status}`);
+    assertNotMatch(r.stdout, 'Bgt', `CC_STATUSLINE_BUDGET=${JSON.stringify(v)} must not render a gauge`);
+  }
 });
 
 check('narrow terminal never overflows COLUMNS', () => {

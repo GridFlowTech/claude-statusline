@@ -6,6 +6,7 @@ root**, because `transcript_path` is relative:
 ```bash
 node statusline.js          < examples/payload.json
 node statusline.js          < examples/payload-minimal.json
+CC_STATUSLINE_BUDGET=250 node statusline.js < examples/payload-api.json
 node subagent-statusline.js < examples/subagent-payload.json
 ```
 
@@ -13,6 +14,7 @@ node subagent-statusline.js < examples/subagent-payload.json
 | --- | --- |
 | `payload.json` | Everything populated: 1M context, effort, thinking, fast mode, worktree, both rate limits, a named agent |
 | `payload-minimal.json` | The null cases — `current_usage: null`, `rate_limits: null`, null percentages, no `effort`, no `workspace` |
+| `payload-api.json` | A billed plan (API key, Bedrock, Vertex, Enterprise): no `rate_limits` at all, so the windows give way to `$/Mtok` and, with `CC_STATUSLINE_BUDGET` set, `Bgt` |
 | `subagent-payload.json` | Four agent-panel rows: two running, one completed, one failed with an unrecognised model id |
 | `transcript.jsonl` | Nine records covering the transcript accumulator |
 

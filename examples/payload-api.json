@@ -1,0 +1,40 @@
+{
+  "cwd": "/home/you/code/my-project",
+  "session_id": "3f0c1a9e-5d21-4f88-9a17-2b6c4e0d7a55",
+  "session_name": "bedrock-migration",
+  "transcript_path": "examples/transcript.jsonl",
+  "model": {
+    "id": "claude-opus-5",
+    "display_name": "Opus 5"
+  },
+  "workspace": {
+    "current_dir": "/home/you/code/my-project",
+    "project_dir": "/home/you/code/my-project",
+    "added_dirs": []
+  },
+  "version": "2.1.220",
+  "output_style": { "name": "default" },
+  "cost": {
+    "total_cost_usd": 4.8712,
+    "total_duration_ms": 3600000,
+    "total_api_duration_ms": 900000,
+    "total_lines_added": 156,
+    "total_lines_removed": 23
+  },
+  "context_window": {
+    "total_input_tokens": 152000,
+    "total_output_tokens": 878,
+    "context_window_size": 200000,
+    "used_percentage": 76,
+    "remaining_percentage": 24,
+    "current_usage": {
+      "input_tokens": 2,
+      "output_tokens": 878,
+      "cache_creation_input_tokens": 12000,
+      "cache_read_input_tokens": 140000
+    }
+  },
+  "exceeds_200k_tokens": false,
+  "fast_mode": false,
+  "thinking": { "enabled": true }
+}
