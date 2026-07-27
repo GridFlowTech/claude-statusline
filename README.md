@@ -336,8 +336,8 @@ Ctx 15% · In 152,002 Out 153,470 · Cache 98% · LngCtx 76% · 5h 90%:20%↑ 02
 
 | Cell        | Source                              | Notes                                                                  |
 | ----------- | ----------------------------------- | ---------------------------------------------------------------------- |
-| `Ctx n%`    | `context_window.used_percentage`    | Green < 70, yellow ≥ 70, red ≥ 90. `0%` when null.                     |
-| `In`        | `context_window.total_input_tokens` | Tokens currently in the window.                                        |
+| `Ctx n%`    | `context_window.used_percentage`    | Green < 70, yellow ≥ 70, red ≥ 90. `0%` before the first response, `↺` in the gap after `/compact`. |
+| `In`        | `context_window.total_input_tokens` | Tokens currently in the window. `↺` while the post-`/compact` size is unknown. |
 | `Out`       | **transcript**                      | Session-cumulative output. Not available from the payload - see below. |
 | `Cache n%`  | **transcript**                      | Session-cumulative hit rate. Inverted colour scale - high is good.     |
 | `LngCtx n%` | computed, `exceeds_200k_tokens`     | Progress toward the fixed 200k threshold. Extended windows only.       |
@@ -345,12 +345,13 @@ Ctx 15% · In 152,002 Out 153,470 · Cache 98% · LngCtx 76% · 5h 90%:20%↑ 02
 | `7d`        | `rate_limits.seven_day`             | Subscription plans only.                                               |
 | `Bgt`       | ledger + `CC_STATUSLINE_BUDGET`     | Billed plans only, and only with a budget set. See below.              |
 | `$/Mtok`    | `cost` + **transcript**             | Billed plans only, and only with a readable transcript.                |
+| `Fable n%`  | ledger + `rate_limits.seven_day`    | Estimated share of the Fable allowance spent. Trails the line, and only while Fable is the active model. See below. |
 
 Context and rate limits share one line because they answer the same question -
 how much runway is left - and because merging them lets the width budget be
 allocated across all of it at once.
 
-The last two slots hold whichever pair is real. `rate_limits` is sent only to
+The constraint slots hold whichever pair is real. `rate_limits` is sent only to
 Claude.ai subscribers, so on an API key, Bedrock, Vertex or Enterprise
 deployment the windows are replaced by the budget gauge and the blended token
 rate rather than sitting there reading `n/a` forever:
@@ -361,6 +362,13 @@ Ctx 76% · In 152,002 Out 153,470 · Cache 98% · Bgt $24.36/250:11h · $/Mtok 1
 
 That one is a 200k model, which is also why `LngCtx` is absent - see
 [LngCtx](#lngctx).
+
+`Fable` trails the constraint pair rather than sitting beside `LngCtx`, so all
+three limit gauges read left to right as one group:
+
+```text
+Ctx 15% · In 152,002 Out 878 · Cache 92% · 5h 6%:34%↓:3h · 7d 41%:50%↓:3d · Fable 82%
+```
 
 ### Line 3 - money
 
@@ -784,6 +792,48 @@ waste a slot on a duplicate. It renders when `context_window_size` is above
 window size: input plus output can overshoot 200k on a 200k model too, and that
 crossing is a billing event, not a gauge reading.
 
+### Fable
+
+As of July 2026 a subscription may spend up to half its weekly limit on Fable 5.
+That makes the `7d` cell alone useless for pacing Fable: a 40% weekly reading is
+comfortable if it is all Sonnet and nearly spent if it is all Fable. So the
+ledger keeps Fable spend in its own seven-day bucket, and while Fable is the
+active model the bar reports that bucket against the Fable allowance rather than
+against the whole limit.
+
+```text
+share  = min(1, ledger.fable / ledger.fableWindow)
+Fable% = min(100, seven_day.used_percentage × share / CC_STATUSLINE_FABLE_SHARE × 100)
+```
+
+Colours match `Ctx` - green < 70, yellow ≥ 70, red ≥ 90.
+
+**This is an estimate, not a measurement.** The payload carries no model-scoped
+weekly bucket - `rate_limits` is exactly `five_hour` and `seven_day` - so the
+only way to split the weekly figure by model is to weight it by the model's
+share of local ledger spend over the same window. Upstream ccstatusline reads an
+authoritative per-model figure from the server instead; that needs OAuth and a
+network round trip, and nothing here does either on the render path.
+
+The window is anchored on `seven_day.resets_at` minus seven days, not on a local
+calendar boundary, so the bucket and the limit it is measured against cover the
+same period. Spend is attributed **by delta**: a `/model` switch mid-session
+moves only the dollars spent after the switch, rather than retroactively
+reassigning the whole session to whichever model happened to be active at the
+last render.
+
+`CC_STATUSLINE_FABLE_SHARE` sets the allowance percentage. It is the one number
+in the formula that is a policy assumption rather than a payload field, which is
+why it is the only knob - the default tracks the July 2026 policy and the env var
+covers it moving.
+
+**The cell reads low on first install.** The Fable bucket is a new ledger field,
+so sessions recorded before it existed carry no attribution and the estimate
+starts near zero. It becomes accurate once the rolling seven-day window has
+turned over. It collapses entirely on a billed plan, which is correct: there is
+no Fable allowance to pace against there, only dollars, and `Bgt` already covers
+those.
+
 ### Burn rate
 
 ```text
@@ -952,13 +1002,14 @@ In `subagent-statusline.js`:
 | `CC_STATUSLINE_NOGIT=1`   | Skip the git subprocess entirely. Saves ~79 ms per render.                           |
 | `NO_COLOR=1`              | Disable all ANSI colour ([no-color.org](https://no-color.org) convention).           |
 | `CC_STATUSLINE_NOCOLOR=1` | Same, without affecting other tools.                                                 |
-| `CC_STATUSLINE_ASCII=1`   | Replace `↑ → ↓ ⎇ ✓ ⇡ ⇣` with `^ = v br ok ^ v`. Use if your console font boxes them. |
+| `CC_STATUSLINE_ASCII=1`   | Replace `↑ → ↓ ⎇ ✓ ⇡ ⇣ ↺` with `^ = v br ok ^ v ~`. Use if your console font boxes them. |
 | `COLUMNS`                 | Set by Claude Code; see below.                                                       |
 | `CLAUDE_CONFIG_DIR`       | Relocates `.claude`, including the ledger and plugin flags.                          |
 | `CC_STATUSLINE_BUDGET`    | Dollar allocation for billed plans. Turns on the `Bgt` cell. [Details](#budget---api-bedrock-vertex-and-enterprise) |
 | `CC_STATUSLINE_BUDGET_PERIOD` | `day`, `week` or `month` (default).                                              |
 | `CC_STATUSLINE_BUDGET_RESET`  | `HH:MM` the budget period rolls over. `17:00` matches Console billing.           |
 | `CC_STATUSLINE_BUDGET_OFFSET` | Period spend the local ledger never saw.                                         |
+| `CC_STATUSLINE_FABLE_SHARE`   | Percent of the weekly limit Fable may use. Default `50`. Drives the `Fable` cell. |
 
 ---
 
@@ -985,6 +1036,13 @@ so they outlive token counts, the cache rate and LngCtx. `Bgt` inherits that
 rank on billed plans for the same reason - it is the constraint that ends the
 day's work. `$/Mtok` is ranked 5 and goes early; it is a diagnostic, not a
 runway.
+
+`Fable` is ranked 2, the same as `LngCtx`, but sits to its right - so the
+tie-break drops `Fable` first. That is the cost of grouping it with the other
+two limit gauges instead of placing it mid-line: it buys a line that reads as
+one group at full width and gives up a few columns of survival at the narrow
+end. Both are estimates of a tier boundary rather than measurements of it, and
+neither is worth a rank-1 slot ahead of the windows themselves.
 
 Observed degradation:
 

@@ -17,7 +17,8 @@
  *   stdin  : one JSON object (schema: https://code.claude.com/docs/en/statusline)
  *   stdout : 4 lines, plus an optional 5th when a named agent is active.
  *              1. model and mode flags
- *              2. runway   -- context, cache, LngCtx, both rate-limit windows
+ *              2. runway   -- context, cache, LngCtx, the Fable allowance,
+ *                             both rate-limit windows
  *              3. money    -- session / day / week / month, and burn rate
  *              4. place    -- repo, branch and working-tree state, session name
  *
@@ -35,6 +36,10 @@
  *   whole `rate_limits` object is absent on API/enterprise billing. Therefore
  *   every single field read below goes through `?.` + `??` or a numeric
  *   coercion helper. Never assume an object exists just because its parent did.
+ *
+ *   The post-/compact null is the one case where `?? 0` is itself a bug: the
+ *   window shrank, it did not empty. contextState() is the single place that
+ *   decides what the context reads as while those fields are null.
  * ========================================================================== */
 
 const fs = require('fs');
@@ -134,6 +139,39 @@ const BUDGET_RESET = (() => {
 const BUDGET_OFFSET = (() => {
   const n = Number(process.env.CC_STATUSLINE_BUDGET_OFFSET);
   return Number.isFinite(n) && n > 0 ? n : 0;
+})();
+
+/* ---------------------------------------------------------------------------
+ * Fable allowance. As of July 2026 a subscription may spend up to half of its
+ * weekly limit on Fable 5, which makes the 7d cell alone useless for pacing
+ * Fable: a 40% weekly reading is comfortable if it is all Sonnet and nearly
+ * spent if it is all Fable. So the ledger keeps Fable spend in its own
+ * seven-day bucket, and while Fable is the active model the bar reports that
+ * bucket as a percentage of the Fable allowance rather than of the whole limit.
+ *
+ *   CC_STATUSLINE_FABLE_SHARE=50  percent of the weekly limit Fable may use
+ *
+ * The allowance itself is derived from the seven-day window the host already
+ * reports -- see fableCell(). That window is subscription-only, so on a billed
+ * plan the cell simply collapses, which is correct: a billed account has no
+ * Fable allowance to pace against, only dollars, and `Bgt` already covers those.
+ *
+ * The upstream ccstatusline reads this figure straight from the server, which
+ * returns a per-model weekly bucket already normalised against the Fable
+ * allowance. That endpoint is not reachable from here: it needs OAuth and a
+ * network round trip, and this file does neither on the render path. The
+ * statusline payload carries no model-scoped bucket either -- `rate_limits` is
+ * exactly `five_hour` and `seven_day` -- so the local estimate below is the
+ * only option, and the share is the one number in it that is an assumption
+ * rather than a measurement, which is why it is the only knob.
+ * ------------------------------------------------------------------------ */
+
+// Percent of the weekly subscription limit Fable 5 may consume. A product
+// policy number rather than a payload field, so it is overridable: the default
+// tracks the July 2026 policy and the env var covers it moving.
+const FABLE_WEEKLY_SHARE = (() => {
+  const n = Number(process.env.CC_STATUSLINE_FABLE_SHARE);
+  return Number.isFinite(n) && n > 0 && n <= 100 ? n : 50;
 })();
 
 /* ---------------------------------------------------------------------------
@@ -262,6 +300,18 @@ function pctColor(p) {
  *  terminals honour just the same -- would let it inject escape sequences. */
 const CONTROL_RE = /[\x00-\x1f\x7f-\x9f]/g;
 const cleanText = (s) => (typeof s === 'string' ? s.replace(CONTROL_RE, '').trim() : '');
+
+/** Is Fable the model behind this render?
+ *
+ *  display_name is the field the host actually populates ("Claude Fable 5");
+ *  the id is checked as well so a host that ships a shortened or localised
+ *  display string cannot silently stop the allowance tracking. Both reads are
+ *  coerced through String() -- a non-string here must be a miss, not a throw. */
+const FABLE_RE = /fable/i;
+function isFableModel(d) {
+  return FABLE_RE.test(String(d?.model?.display_name ?? '')) ||
+         FABLE_RE.test(String(d?.model?.id ?? ''));
+}
 
 /** Honors CLAUDE_CONFIG_DIR the same way Claude Code and both plugins do. */
 function claudeDir() {
@@ -616,6 +666,7 @@ function accumulateTranscript(rec, transcriptPath) {
     rec.tIn = 0;
     rec.tCc = 0;
     rec.tCr = 0;
+    rec.tCtx = null;
   }
 
   if (size - rec.tOff > TRANSCRIPT_MAX_READ_BYTES) {
@@ -669,10 +720,23 @@ function accumulateTranscript(rec, transcriptPath) {
       if (id && id === rec.tId) continue;   // same response, streamed again
       rec.tId = id;
 
+      const rIn = num(u.input_tokens) ?? 0;
+      const rCc = num(u.cache_creation_input_tokens) ?? 0;
+      const rCr = num(u.cache_read_input_tokens) ?? 0;
+
       rec.tOut += num(u.output_tokens) ?? 0;
-      rec.tIn += num(u.input_tokens) ?? 0;
-      rec.tCc += num(u.cache_creation_input_tokens) ?? 0;
-      rec.tCr += num(u.cache_read_input_tokens) ?? 0;
+      rec.tIn += rIn;
+      rec.tCc += rCc;
+      rec.tCr += rCr;
+
+      // The context LENGTH at this response -- assigned, never summed. The
+      // four counters above are lifetime billing figures: they only ever grow,
+      // and /compact shrinks the live window without touching them, so using
+      // them as a context gauge reports the historical maximum forever after a
+      // compaction. This one field is the only honest transcript-side answer
+      // to "how big is the window right now", and it drops on its own the
+      // moment the first post-compaction response is written.
+      rec.tCtx = rIn + rCc + rCr;
     }
   }
 
@@ -686,6 +750,125 @@ function tokenTotals(rec) {
     cacheCreate: num(rec.tCc) ?? 0,
     cacheRead: num(rec.tCr) ?? 0,
   };
+}
+
+/* ---------------------------------------------------------------------------
+ * Context window state (the /compact boundary)
+ * ----------------------------------------------------------------------------
+ * `/compact` nulls every context_window field and leaves them null until the
+ * next API response lands. Three different wrong answers are available in that
+ * gap, and this is the one place that rules all three out:
+ *
+ *   0%             -- what the raw payload coerces to. The window is not empty,
+ *                     it is unknown, and a gauge that drops to zero and springs
+ *                     back one response later reads as a rendering fault.
+ *   the last value -- the pre-compaction figure, i.e. the session's historical
+ *                     maximum. Reporting it is worse than reporting nothing,
+ *                     because /compact is precisely the event that made it
+ *                     false.
+ *   rec.tIn        -- the transcript's CUMULATIVE input total. This is the
+ *                     tempting fallback and it is mathematically wrong: it is a
+ *                     lifetime billing sum that only grows, so on any session
+ *                     past its first compaction it overshoots the real window
+ *                     by whole multiples. It is deliberately never read here.
+ *
+ * Instead the ledger carries a four-field state machine per session, so the
+ * boundary is observed once and remembered across renders:
+ *
+ *   cSeen : the payload has reported a live context at least once
+ *   cIn   : the last live total_input_tokens
+ *   cComp : we are inside a post-compaction gap
+ *   cMax  : the context length at the instant the gap opened -- the ceiling
+ *           that must not be reported as current
+ *
+ * The transcript catches up before the payload does, so once a post-compaction
+ * response is written the real shrunk length is available and is shown. A
+ * transcript value that has not visibly shrunk is still the pre-compaction
+ * response (or /compact's own summarisation call, whose input is the entire
+ * history it is summarising), so it is refused rather than believed.
+ * ------------------------------------------------------------------------ */
+
+// How much smaller than the pre-compaction ceiling a transcript reading has to
+// be before it is accepted as post-compaction. A real compaction collapses the
+// window by far more than a quarter; anything above this is the old response.
+const COMPACT_SHRINK_RATIO = 0.75;
+
+/**
+ * @param rec ledger record, or null when there is no usable session id
+ * @returns {{input:number|null, pct:number|null, compacted:boolean, changed:boolean}}
+ *          `input`/`pct` are null when the length is genuinely unknown -- the
+ *          caller renders that as a marker, never as a number.
+ */
+function contextState(d, rec) {
+  const cw = d?.context_window;
+  // Zero is the host's "no data yet" sentinel, not a measurement. The schema
+  // defines total_input_tokens/total_output_tokens as 0 before the first API
+  // response, and a live window is never genuinely empty -- the system prompt
+  // alone is thousands of tokens, and used_percentage is a float, so a real
+  // context reads 0.5 rather than 0. Accepting a zero as live would defeat the
+  // gap detection below on any host that ZEROES these fields after /compact
+  // instead of nulling them, and put the "Ctx 0%" flash straight back.
+  const rawIn = num(cw?.total_input_tokens);
+  const rawPct = num(cw?.used_percentage);
+  const liveIn = rawIn !== null && rawIn > 0 ? rawIn : null;
+  const livePct = rawPct !== null && rawPct > 0 ? rawPct : null;
+  const liveSize = num(cw?.context_window_size);
+  // The window size is a property of the model, not of the turn, so the last
+  // one seen stays correct while the payload's copy is null -- and without it
+  // there is no denominator to turn a recovered length into a percentage
+  // during a compaction gap.
+  const size = liveSize ?? num(rec?.cSize);
+
+  // used_percentage can lag total_input_tokens by a response, so derive it when
+  // only the token count is there. Without this the gauge reads 0% on exactly
+  // the response that ends a compaction gap -- the one frame the whole state
+  // machine exists to get right.
+  const pctOf = (input) =>
+    input !== null && size !== null && size > 0 ? Math.min(100, (input / size) * 100) : null;
+
+  const live = liveIn !== null || livePct !== null;
+
+  // No record to persist into: the payload is all there is.
+  if (!rec) {
+    return { input: liveIn, pct: livePct ?? pctOf(liveIn), compacted: false, changed: false };
+  }
+
+  let changed = false;
+
+  if (live) {
+    // A response has landed. The payload is authoritative again and whatever
+    // gap we were in is over.
+    if (rec.cComp) { rec.cComp = 0; changed = true; }
+    if (!rec.cSeen) { rec.cSeen = 1; changed = true; }
+    if (liveIn !== null && rec.cIn !== liveIn) { rec.cIn = liveIn; changed = true; }
+    if (liveSize !== null && rec.cSize !== liveSize) { rec.cSize = liveSize; changed = true; }
+    return { input: liveIn, pct: livePct ?? pctOf(liveIn), compacted: false, changed };
+  }
+
+  if (!rec.cSeen) {
+    // Nothing has ever been live: a fresh session before its first API call.
+    // A RESUMED session is the same shape from the payload's side but not from
+    // the transcript's -- it already holds a response, and tCtx is that
+    // response's real window size, so the gauge starts populated instead of at
+    // zero.
+    const t = num(rec.tCtx);
+    return { input: t, pct: pctOf(t), compacted: false, changed };
+  }
+
+  // Live -> null with a response already behind us is the /compact boundary.
+  // Freeze the pre-compaction length as the ceiling and drop it from cIn so no
+  // later read can hand it back as the current window.
+  if (!rec.cComp) {
+    rec.cComp = 1;
+    rec.cMax = num(rec.cIn) ?? 0;
+    rec.cIn = null;
+    changed = true;
+  }
+
+  const t = num(rec.tCtx);
+  const ceiling = num(rec.cMax) ?? 0;
+  const shrunk = t !== null && (ceiling <= 0 || t <= ceiling * COMPACT_SHRINK_RATIO);
+  return { input: shrunk ? t : null, pct: shrunk ? pctOf(t) : null, compacted: true, changed };
 }
 
 function loadLedger(file) {
@@ -769,16 +952,25 @@ function budgetWindow(nowMs) {
   return { start, end };
 }
 
-function updateLedger(sessionId, sessionCost, transcriptPath) {
+function updateLedger(d) {
   // The id becomes a plain-object key. Refuse anything that could collide with
   // Object.prototype ("__proto__", "constructor") or smuggle odd characters --
   // a hostile id degrades to "count the cost, skip the ledger record".
+  let sessionId = d?.session_id;
   if (typeof sessionId !== 'string' || !/^[\w.-]{1,128}$/.test(sessionId) ||
       sessionId === '__proto__' || sessionId === 'constructor') {
     sessionId = '';
   }
-  const cost = num(sessionCost) ?? 0;
-  const totals = { session: cost, day: cost, week: cost, month: cost, tokens: null, period: null, periodEnd: null };
+  const cost = num(d?.cost?.total_cost_usd) ?? 0;
+  const fable = isFableModel(d);
+  const totals = {
+    session: cost, day: cost, week: cost, month: cost,
+    tokens: null, period: null, periodEnd: null,
+    fable: 0, fableWindow: 0,
+    // Resolved from the payload alone for now. Every early return below still
+    // hands back a usable context reading rather than an implicit zero.
+    context: contextState(d, null),
+  };
 
   let file;
   try { file = ledgerPath(); } catch { return totals; }
@@ -795,13 +987,25 @@ function updateLedger(sessionId, sessionCost, transcriptPath) {
       ? store.sessions[sessionId]
       : undefined;
     if (!rec || typeof rec !== 'object') {
-      rec = store.sessions[sessionId] = { first: now, last: now, cost };
+      // A session first seen while Fable is active has no earlier model to
+      // split against, so everything it has spent so far is Fable's. In
+      // practice that is $0 -- the first render lands before the first
+      // response does.
+      rec = store.sessions[sessionId] = { first: now, last: now, cost, fab: fable ? cost : 0 };
       dirty = true;
     } else {
-      const best = Math.max(num(rec.cost) ?? 0, cost);
+      const prev = num(rec.cost) ?? 0;
+      const best = Math.max(prev, cost);
       // Only rewrite when the number actually moved. At a 300ms debounce this
       // turns most renders into a pure read and keeps the disk quiet.
       if (best !== rec.cost) { rec.cost = best; dirty = true; }
+      // Segregate by DELTA, not by session. /model switches mid-session, and
+      // attributing a whole session to whichever model happened to be active
+      // at the last render would move dollars between buckets retroactively --
+      // a Sonnet session that ends with one Fable turn would land entirely in
+      // the Fable bucket. Only spend that accrued while Fable was the active
+      // model is Fable's.
+      if (fable && best > prev) { rec.fab = (num(rec.fab) ?? 0) + (best - prev); dirty = true; }
       if (!num(rec.first)) { rec.first = now; dirty = true; }
     }
 
@@ -809,11 +1013,22 @@ function updateLedger(sessionId, sessionCost, transcriptPath) {
     // mean two file round-trips per render for the same session record.
     const beforeOffset = rec.tOff;
     try {
-      totals.tokens = accumulateTranscript(rec, transcriptPath);
+      totals.tokens = accumulateTranscript(rec, d?.transcript_path);
     } catch {
       totals.tokens = null;
     }
     if (rec.tOff !== beforeOffset) dirty = true;
+
+    // Strictly AFTER the transcript pass: inside a compaction gap the shrunk
+    // window shows up in the transcript before the payload admits it exists,
+    // and contextState() reads rec.tCtx to find it.
+    try {
+      const ctx = contextState(d, rec);
+      totals.context = ctx;
+      if (ctx.changed) dirty = true;
+    } catch {
+      /* keep the payload-only reading established above */
+    }
 
     if (dirty) rec.last = now;
   }
@@ -829,10 +1044,10 @@ function updateLedger(sessionId, sessionCost, transcriptPath) {
   }
 
   // --- roll up ------------------------------------------------------------
-  const d = new Date(now);
-  const startOfToday = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const today = new Date(now);
+  const startOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
   const startOfWeek = startOfToday - 6 * 86400000;                      // today + previous 6 days
-  const startOfMonth = new Date(d.getFullYear(), d.getMonth(), 1).getTime();
+  const startOfMonth = new Date(today.getFullYear(), today.getMonth(), 1).getTime();
 
   // The budget period is a separate window from the D/W/M buckets: it can end
   // at 17:00 on the last day of the month rather than at a calendar boundary,
@@ -843,6 +1058,18 @@ function updateLedger(sessionId, sessionCost, transcriptPath) {
     totals.period = BUDGET_OFFSET;
     totals.periodEnd = win.end;
   }
+
+  // The Fable allowance is scoped to the same seven-day window the weekly limit
+  // uses, so anchor on the host's own `resets_at` rather than on a local
+  // calendar boundary -- a bucket that disagrees with the window it is measured
+  // against is worse than no bucket. A stamp that is not plausibly the end of
+  // the window we are inside would slide the bucket by days, so it is refused
+  // and a rolling seven days is used instead (also the billed-plan path, where
+  // no window is sent at all).
+  const resetsMs = (num(d?.rate_limits?.seven_day?.resets_at) ?? 0) * 1000;
+  const fableStart = resetsMs > now && resetsMs - now <= SEVEN_DAY_SECONDS * 1000
+    ? resetsMs - SEVEN_DAY_SECONDS * 1000
+    : now - SEVEN_DAY_SECONDS * 1000;
 
   totals.day = 0;
   totals.week = 0;
@@ -855,6 +1082,14 @@ function updateLedger(sessionId, sessionCost, transcriptPath) {
     if (anchor >= startOfWeek) totals.week += c;
     if (anchor >= startOfMonth) totals.month += c;
     if (win && anchor >= win.start && anchor < win.end) totals.period += c;
+    if (anchor >= fableStart) {
+      // Both halves of the ratio come from the same window, so an incomplete
+      // ledger (installed mid-week, work done on another machine) skews them
+      // together and the Fable SHARE stays roughly right even when neither
+      // absolute figure is.
+      totals.fable += num(rec.fab) ?? 0;
+      totals.fableWindow += c;
+    }
   }
 
   // A brand-new session that hasn't been flushed yet must still appear in the
@@ -863,6 +1098,8 @@ function updateLedger(sessionId, sessionCost, transcriptPath) {
     totals.day += cost;
     totals.week += cost;
     totals.month += cost;
+    totals.fableWindow += cost;
+    if (fable) totals.fable += cost;
     if (win) totals.period += cost;
   }
 
@@ -1014,8 +1251,8 @@ function lineModel(d, maxWidth) {
 /* Glyphs used by the repo line. CC_STATUSLINE_ASCII swaps in plain text for
  * consoles whose font boxes them. */
 const GLYPH = ASCII_ARROWS
-  ? { branch: 'br', clean: 'ok', ahead: '^', behind: 'v' }
-  : { branch: '⎇', clean: '✓', ahead: '⇡', behind: '⇣' };
+  ? { branch: 'br', clean: 'ok', ahead: '^', behind: 'v', compact: '~' }
+  : { branch: '⎇', clean: '✓', ahead: '⇡', behind: '⇣', compact: '↺' };
 
 /**
  * Line 1: repo - branch and working-tree state - session name
@@ -1238,26 +1475,89 @@ function tokenRateCell(sessionCost, tokens) {
   return `${dim('$/Mtok')} ${dim(((sessionCost * 1e6) / tokens).toFixed(2))}`;
 }
 
+/**
+ * Fable's share of the weekly allowance, spent: "Fable 42%".
+ *
+ * Shown only while Fable is the active model -- it is a pacing gauge for the
+ * decision you are making right now, not a historical statistic, and on any
+ * other model it would just be a column of noise.
+ *
+ * Dollars are the only currency the local ledger and the host's seven-day
+ * window have in common, so Fable's slice of the window's SPEND is taken as its
+ * slice of the window's LIMIT, and that is measured against the share Fable is
+ * allowed to take. Both figures come from the same seven days, so an incomplete
+ * ledger (installed mid-week, work done on another machine) moves them together
+ * and mostly cancels out of the ratio.
+ *
+ * This is an estimate, and the assumption inside it is that a dollar of Fable
+ * and a dollar of Sonnet consume the same fraction of the weekly limit. They do
+ * not, exactly. It is the closest thing available without leaving the payload.
+ *
+ * No seven-day window (billed plans) -> empty, and the cell collapses.
+ */
+function fableCell(d, t) {
+  if (!isFableModel(d)) return '';
+
+  const spent = num(t?.fable);
+  const weekPct = num(d?.rate_limits?.seven_day?.used_percentage);
+  const windowSpend = num(t?.fableWindow);
+  if (spent === null || spent < 0) return '';
+  if (weekPct === null || windowSpend === null || windowSpend <= 0) return '';
+
+  // Guard the share against a ledger that somehow recorded more Fable spend
+  // than total spend -- a partially pruned store can do it, and it must not
+  // project past the whole window.
+  const share = Math.min(1, spent / windowSpend);
+
+  // Clamped at 100 because this estimates a percentage of a limit that cannot
+  // be exceeded: the API stops you there. A reading past it is estimator error,
+  // not headroom that was actually spent, and "Fable 180%" would present the
+  // error as the measurement. Upstream clamps its authoritative figure the same
+  // way.
+  const pct = Math.min(100, ((weekPct * share) / FABLE_WEEKLY_SHARE) * 100);
+  if (!Number.isFinite(pct)) return '';
+
+  return `${dim('Fable')} ${pctColor(Math.max(0, pct))(`${Math.round(Math.max(0, pct))}%`)}`;
+}
+
 function lineUsage(d, ledger, nowSeconds, maxWidth) {
   const cw = d?.context_window;
+  const usage = cw?.current_usage;
 
-  const usedPct = num(cw?.used_percentage) ?? 0;
-  const ctx = `${dim('Ctx')} ${pctColor(usedPct)(`${Math.round(usedPct)}%`)}`;
+  // The window's length and percentage come from the ledger's context state
+  // machine rather than straight off the payload: /compact nulls both fields
+  // until the next response lands, and every obvious fallback from there is
+  // wrong in a different way. See contextState(). `compacted` means "inside
+  // that gap"; a null length there means the shrunk size is not knowable yet
+  // and is rendered as a marker instead of as a number.
+  const ctxState = ledger?.context;
+  const compacted = ctxState?.compacted === true;
+
+  const usedPct = num(ctxState?.pct);
+  const ctx = usedPct !== null
+    ? `${dim('Ctx')} ${pctColor(usedPct)(`${Math.round(usedPct)}%`)}`
+    : compacted
+      ? `${dim('Ctx')} ${cyan(GLYPH.compact)}`
+      : `${dim('Ctx')} ${pctColor(0)('0%')}`;
 
   // Token counts come from the COMBINED totals, not current_usage.
   //
   // current_usage.input_tokens is fresh, uncached input only -- on a warm
   // session that is a single-digit number ("In 2") while the context actually
-  // holds tens of thousands of tokens, which reads as broken. total_input_tokens
-  // is the sum of input + cache_creation + cache_read, i.e. what is really in
-  // the window. current_usage is still used below for the cache split, which is
-  // the one thing it is genuinely the right source for.
-  const usage = cw?.current_usage;
+  // holds tens of thousands of tokens, which reads as broken. The state machine
+  // resolves total_input_tokens, the sum of input + cache_creation +
+  // cache_read, i.e. what is really in the window. current_usage is still used
+  // below for the cache split, which is the one thing it is genuinely the right
+  // source for -- and as a last-resort sum here, EXCEPT inside a compaction gap
+  // where it is null and summing it prints exactly the "In 0" flash this path
+  // exists to remove.
   const inTok =
-    num(cw?.total_input_tokens) ??
-    (num(usage?.input_tokens) ?? 0) +
-      (num(usage?.cache_creation_input_tokens) ?? 0) +
-      (num(usage?.cache_read_input_tokens) ?? 0);
+    num(ctxState?.input) ??
+    (compacted
+      ? null
+      : (num(usage?.input_tokens) ?? 0) +
+        (num(usage?.cache_creation_input_tokens) ?? 0) +
+        (num(usage?.cache_read_input_tokens) ?? 0));
 
   // Out is the session's CUMULATIVE output, accumulated from the transcript.
   // Neither payload field can supply this: total_output_tokens and
@@ -1266,7 +1566,11 @@ function lineUsage(d, ledger, nowSeconds, maxWidth) {
   // Falls back to the payload when the transcript is unreadable.
   const tok = ledger?.tokens;
   const outTok = num(tok?.out) ?? num(cw?.total_output_tokens) ?? num(usage?.output_tokens) ?? 0;
-  const tokens = `${dim('In')} ${group(inTok)} ${dim('Out')} ${group(outTok)}`;
+  // Out is a lifetime figure and survives compaction untouched -- it is what
+  // the session has generated, not what is in the window -- so only In can be
+  // unknown here.
+  const inText = inTok === null ? dim(GLYPH.compact) : group(inTok);
+  const tokens = `${dim('In')} ${inText} ${dim('Out')} ${group(outTok)}`;
 
   // cache_read / (input + cache_creation + cache_read). Denominator 0 -> 0%.
   //
@@ -1297,7 +1601,10 @@ function lineUsage(d, ledger, nowSeconds, maxWidth) {
   // output, not the session's running total. Mixing the two inflates the gauge
   // past 100% on any long session regardless of actual request size.
   const lastOutTok = num(cw?.total_output_tokens) ?? num(usage?.output_tokens) ?? 0;
-  const longPct = ((inTok + lastOutTok) / 200000) * 100;
+  // Unknown input length -> no gauge at all. Inside a compaction gap the honest
+  // answer is "not yet", and a fabricated 0% would read as "plenty of room" at
+  // the one moment the number is least trustworthy.
+  const longPct = inTok === null ? null : ((inTok + lastOutTok) / 200000) * 100;
   // exceeds_200k_tokens is authoritative for the crossing itself: it is
   // computed host-side from the same response, so trust it over our arithmetic
   // when the two disagree at the boundary.
@@ -1307,7 +1614,7 @@ function lineUsage(d, ledger, nowSeconds, maxWidth) {
   // the number -- at that point it is a billing-tier change, not a gauge, and
   // a dim label beside a red figure reads as ordinary.
   const longLabel = overLong ? red('LngCtx') : dim('LngCtx');
-  const longCtx = `${longLabel} ${longColor(`${Math.round(longPct)}%`)}`;
+  const longCtx = longPct === null ? '' : `${longLabel} ${longColor(`${Math.round(longPct)}%`)}`;
 
   // On a 200k model the gauge is Ctx plus one response's output -- the same
   // number twice, since used_percentage is that same input total over that same
@@ -1317,7 +1624,7 @@ function lineUsage(d, ledger, nowSeconds, maxWidth) {
   // billing-tier event worth a red label even when the percentage is redundant.
   // An unknown window size keeps the cell rather than guessing it away.
   const windowSize = num(cw?.context_window_size);
-  const showLong = overLong || windowSize === null || windowSize > 200000;
+  const showLong = longCtx !== '' && (overLong || windowSize === null || windowSize > 200000);
 
   const rl = d?.rate_limits;
   const hasWindow =
@@ -1364,6 +1671,9 @@ function lineUsage(d, ledger, nowSeconds, maxWidth) {
     cell(cache, 3),
     cell(showLong ? longCtx : '', 2),
     ...constraint,
+    // Rank 2, placed LAST on the line. Being rightmost means the equal-rank
+    // tie with LngCtx -- fit() drops the rightmost -- now takes Fable first.
+    cell(fableCell(d, ledger), 2),
   ], SEP, maxWidth);
 }
 
@@ -1565,8 +1875,13 @@ function main() {
   // One ledger round-trip per render, shared by the two lines that need it.
   // It carries both the cost roll-ups and the accumulated token totals.
   const ledger = safe(
-    () => updateLedger(data?.session_id, data?.cost?.total_cost_usd, data?.transcript_path),
-    { session: 0, day: 0, week: 0, month: 0, tokens: null, period: null, periodEnd: null }
+    () => updateLedger(data),
+    {
+      session: 0, day: 0, week: 0, month: 0,
+      tokens: null, period: null, periodEnd: null,
+      fable: 0, fableWindow: 0,
+      context: { input: null, pct: null, compacted: false },
+    }
   );
 
   lines.push(safe(() => lineModel(data, width), 'Claude'));
