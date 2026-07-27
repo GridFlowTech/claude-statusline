@@ -352,7 +352,7 @@ Opus 5 (1M context) XHigh Thinking [FAST] [CAVEMAN:ULTRA] [PONYTAIL:ULTRA]
 ### Line 2 - runway
 
 ```text
-Ctx 15% · In 152,000 Out 153,470 · Cache 98% · LngCtx 76% · 5h 90%:20%↑ 02:41:4h · 7d 52%:50%→ 08:06:3d
+Ctx 15% · In 152,002 Out 153,470 · Cache 98% · LngCtx 76% · 5h 90%:20%↑ 02:41:4h · 7d 52%:50%→ 08:06:3d
 ```
 
 | Cell        | Source                              | Notes                                                                  |
@@ -361,11 +361,11 @@ Ctx 15% · In 152,000 Out 153,470 · Cache 98% · LngCtx 76% · 5h 90%:20%↑ 02
 | `In`        | `context_window.total_input_tokens` | Tokens currently in the window.                                        |
 | `Out`       | **transcript**                      | Session-cumulative output. Not available from the payload - see below. |
 | `Cache n%`  | **transcript**                      | Session-cumulative hit rate. Inverted colour scale - high is good.     |
-| `LngCtx n%` | computed, `exceeds_200k_tokens`     | Progress toward the fixed 200k threshold.                              |
+| `LngCtx n%` | computed, `exceeds_200k_tokens`     | Progress toward the fixed 200k threshold. Extended windows only.       |
 | `5h`        | `rate_limits.five_hour`             | Threshold-coloured. Subscription plans only.                           |
 | `7d`        | `rate_limits.seven_day`             | Subscription plans only.                                               |
 | `Bgt`       | ledger + `CC_STATUSLINE_BUDGET`     | Billed plans only, and only with a budget set. See below.              |
-| `$/Mtok`    | `cost` + **transcript**             | Billed plans only. Blended cost per million tokens.                    |
+| `$/Mtok`    | `cost` + **transcript**             | Billed plans only, and only with a readable transcript.                |
 
 Context and rate limits share one line because they answer the same question -
 how much runway is left - and because merging them lets the width budget be
@@ -377,8 +377,11 @@ deployment the windows are replaced by the budget gauge and the blended token
 rate rather than sitting there reading `n/a` forever:
 
 ```text
-Ctx 76% · In 152,000 Out 153,470 · Cache 98% · LngCtx 76% · Bgt $24.36/250:11h · $/Mtok 12.83
+Ctx 76% · In 152,002 Out 153,470 · Cache 98% · Bgt $24.36/250:11h · $/Mtok 12.83
 ```
+
+That one is a 200k model, which is also why `LngCtx` is absent - see
+[LngCtx](#lngctx).
 
 ### Line 3 - money
 
@@ -682,8 +685,13 @@ CC_STATUSLINE_BUDGET_OFFSET=180.40
 
 Blended cost per million tokens: `total_cost_usd` over every token the session
 was billed for, taken from the transcript's cumulative totals (fresh input,
-cache creation, cache reads and output) and falling back to the context window's
-own numbers when the transcript is unreadable.
+cache creation, cache reads and output).
+
+There is no fallback. The payload's token counts are window-scoped - "token
+counts currently in the context window, from the most recent API response" - so
+using them would divide a whole session's cost by a single response's tokens and
+report a rate several times too high. Without the transcript there is no honest
+denominator, and the cell is omitted rather than made up.
 
 Per **million**, not the reference's per 1k: at two decimal places a per-1k
 figure collapses to `$0.01` or `$0.02` for every model on the market - one
@@ -787,6 +795,15 @@ computed host-side from the same response and is authoritative at the boundary.
 It also turns the **`LngCtx` label itself** red, not just the number - once the
 threshold is actually crossed this is a billing-tier change rather than a gauge
 reading, and a dim label beside a red figure reads as ordinary.
+
+**The cell only appears on an extended window.** On a 200k model `Ctx` is
+already `total_input_tokens / 200_000` - the same numerator over the same
+denominator - so `LngCtx` would restate it one response's output higher and
+waste a slot on a duplicate. It renders when `context_window_size` is above
+200k, or when the size is absent and cannot be ruled out. The one exception is
+`exceeds_200k_tokens === true`, which keeps the red label on screen at any
+window size: input plus output can overshoot 200k on a 200k model too, and that
+crossing is a billing event, not a gauge reading.
 
 ### Burn rate
 
@@ -994,7 +1011,7 @@ Observed degradation:
 
 ```text
 COLUMNS=96  Opus 5 (1M context) XHigh Thinking [FAST] [CAVEMAN:ULTRA] [PONYTAIL:ULTRA]
-            Ctx 15% · In 152,000 Out 878 · Cache 92% · LngCtx 76% · 5h 6%:34%↓:3h · 7d 1%:17%↓:5d
+            Ctx 15% · In 152,002 Out 878 · Cache 92% · LngCtx 76% · 5h 6%:34%↓:3h · 7d 1%:17%↓:5d
             S $4.87 · D $24.14 · W $24.14 · M $24.14 · $19.48/hr · API 25%
             my-project · ⎇ main ?1 · statusline-hardening-and-git-state
 
@@ -1121,7 +1138,15 @@ swaps them for `Bgt` / `$/Mtok`. `n/a` that never clears means no response has
 come back yet.
 
 **No `Bgt` cell on a billed plan.** `CC_STATUSLINE_BUDGET` is unset, or set to
-something that is not a positive number. `$/Mtok` shows either way.
+something that is not a positive number. `$/Mtok` shows either way, provided the
+transcript is readable.
+
+**No `$/Mtok` cell on a billed plan.** The transcript at `transcript_path` could
+not be read, so the session has no cumulative token total to divide by. See
+[`$/Mtok`](#mtok).
+
+**No `LngCtx` cell.** Expected on a 200k model, where it would only restate
+`Ctx`. See [LngCtx](#lngctx).
 
 **`Bgt` disagrees with the Console.** The ledger only counts sessions rendered
 on this machine, and it keeps 45 days of them. Set

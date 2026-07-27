@@ -12,13 +12,22 @@ node subagent-statusline.js < examples/subagent-payload.json
 
 | File | What it exercises |
 | --- | --- |
-| `payload.json` | Everything populated: 1M context, effort, thinking, fast mode, worktree, both rate limits, a named agent |
+| `payload.json` | Everything populated: 1M context, effort, thinking, fast mode, worktree, both rate limits, a named agent. The extended window is also the case where `LngCtx` renders |
 | `payload-minimal.json` | The null cases — `current_usage: null`, `rate_limits: null`, null percentages, no `effort`, no `workspace` |
-| `payload-api.json` | A billed plan (API key, Bedrock, Vertex, Enterprise): no `rate_limits` at all, so the windows give way to `$/Mtok` and, with `CC_STATUSLINE_BUDGET` set, `Bgt` |
+| `payload-api.json` | A billed plan (API key, Bedrock, Vertex, Enterprise): no `rate_limits` at all, so the windows give way to `$/Mtok` and, with `CC_STATUSLINE_BUDGET` set, `Bgt`. Its 200k window is also the case where `LngCtx` is suppressed as a duplicate of `Ctx` |
 | `subagent-payload.json` | Four agent-panel rows: two running, one completed, one failed with an unrecognised model id |
 | `transcript.jsonl` | Nine records covering the transcript accumulator |
 
-## Two things to know
+## Three things to know
+
+**The numbers are internally consistent, and are meant to stay that way.**
+`total_input_tokens` equals `input_tokens + cache_creation_input_tokens +
+cache_read_input_tokens` (152,002, not a round 152,000), `used_percentage` is
+that total over `context_window_size`, and `remaining_percentage` is its
+complement. A fixture whose arithmetic disagrees with the host's would send
+anyone debugging against it down a false trail — so if you change one of these
+fields, change the others to match.
+
 
 **`resets_at` is a fixed epoch and will be in the past.** Pace arrows and
 `time until reset` are suppressed for a stale window, so a raw run of

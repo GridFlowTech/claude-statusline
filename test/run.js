@@ -216,10 +216,21 @@ check('LngCtx uses last-response output, not cumulative Out', () => {
   }));
   // (199000 + 100) / 200000 = 99.55% -> 100%. With cumulative 750 it would be 100% too,
   // so assert the value is not inflated past the threshold.
+  assertMatch(r.stdout, 'LngCtx 100%', 'the cell is on screen at all');
   assertNotMatch(r.stdout, 'LngCtx 101%', 'LngCtx must not include cumulative output');
 });
 
-check('exceeds_200k_tokens colours the LngCtx label red', () => {
+check('LngCtx is suppressed on a 200k window as a duplicate of Ctx', () => {
+  // There, used_percentage is the same input total over the same 200k, so the
+  // gauge would just restate Ctx one response's output higher.
+  const r = run(MAIN, basePayload());
+  assertMatch(r.stdout, 'Ctx 3%', 'Ctx still renders');
+  assertNotMatch(r.stdout, 'LngCtx', 'redundant on a standard window');
+});
+
+check('exceeds_200k_tokens keeps LngCtx on a 200k window and colours it red', () => {
+  // The crossing survives the suppression above: it is a billing-tier event,
+  // not a gauge, and it can fire on a 200k model once output is added in.
   const r = run(MAIN, basePayload({ exceeds_200k_tokens: true }), { env: { NO_COLOR: '' } });
   const esc = String.fromCharCode(27);
   assertMatch(r.stdout, `${esc}[38;5;203mLngCtx`, 'red label');
@@ -281,16 +292,18 @@ function seededSandbox(sessions) {
 }
 
 check('no rate_limits after a response swaps the windows for billed cells', () => {
-  const r = run(MAIN, basePayload());
+  const r = run(MAIN, basePayload({ transcript_path: TRANSCRIPT }));
   assertNotMatch(r.stdout, '5h n/a', 'the dead window cells must be gone');
   assertNotMatch(r.stdout, '7d n/a', 'the dead window cells must be gone');
   assertMatch(r.stdout, '$/Mtok', 'billed cells');
 });
 
-check('$/Mtok divides session cost by every token billed', () => {
-  // $1.00 over 5000 in + 100 out = $196.08 per million.
-  const r = run(MAIN, basePayload());
-  assertMatch(r.stdout, '$/Mtok 196.08', 'blended rate');
+check('$/Mtok is suppressed when the transcript is unreadable', () => {
+  // The payload's token counts are window-scoped, so the only available
+  // fallback denominator is one response -- which would report a session rate
+  // several times too high. No denominator, no cell.
+  const r = run(MAIN, basePayload({ transcript_path: '/definitely/not/here.jsonl' }));
+  assertNotMatch(r.stdout, '$/Mtok', 'no cumulative totals, no blended rate');
 });
 
 check('$/Mtok uses the cumulative transcript totals, not the live window', () => {

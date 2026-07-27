@@ -22,7 +22,7 @@
     "total_lines_removed": 23
   },
   "context_window": {
-    "total_input_tokens": 152000,
+    "total_input_tokens": 152002,
     "total_output_tokens": 878,
     "context_window_size": 200000,
     "used_percentage": 76,

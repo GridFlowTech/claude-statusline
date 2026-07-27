@@ -1309,6 +1309,16 @@ function lineUsage(d, ledger, nowSeconds, maxWidth) {
   const longLabel = overLong ? red('LngCtx') : dim('LngCtx');
   const longCtx = `${longLabel} ${longColor(`${Math.round(longPct)}%`)}`;
 
+  // On a 200k model the gauge is Ctx plus one response's output -- the same
+  // number twice, since used_percentage is that same input total over that same
+  // 200k. It earns its slot only where the two genuinely diverge, i.e. on an
+  // extended window. The crossing itself still shows regardless: on a 200k model
+  // input plus output can overshoot 200k, and exceeds_200k_tokens firing is a
+  // billing-tier event worth a red label even when the percentage is redundant.
+  // An unknown window size keeps the cell rather than guessing it away.
+  const windowSize = num(cw?.context_window_size);
+  const showLong = overLong || windowSize === null || windowSize > 200000;
+
   const rl = d?.rate_limits;
   const hasWindow =
     num(rl?.five_hour?.used_percentage) !== null || num(rl?.seven_day?.used_percentage) !== null;
@@ -1324,11 +1334,15 @@ function lineUsage(d, ledger, nowSeconds, maxWidth) {
 
   // Denominator for $/Mtok: session cost has to be divided by everything the
   // session was billed for, not by what happens to be in the window right now.
-  // The transcript totals are the only cumulative input figure available --
-  // without them, fall back to the context window's own numbers.
+  // The transcript totals are the only cumulative token figures available --
+  // the payload's are window-scoped ("token counts currently in the context
+  // window, from the most recent API response"), so falling back to them would
+  // divide a whole session's cost by a single response's tokens and print a
+  // rate several times too high. There is no honest denominator without the
+  // transcript, so null suppresses the cell rather than inventing one.
   const lifetimeTokens = num(tok?.input) !== null
     ? freshIn + cacheCreate + cacheRead + outTok
-    : inTok + outTok;
+    : null;
 
   // Rank 1 on both plans: whichever of the two is real -- the rate-limit
   // windows on a subscription, the allocation on a billed account -- is the
@@ -1348,7 +1362,7 @@ function lineUsage(d, ledger, nowSeconds, maxWidth) {
     cell(ctx, 0),
     cell(tokens, 4),
     cell(cache, 3),
-    cell(longCtx, 2),
+    cell(showLong ? longCtx : '', 2),
     ...constraint,
   ], SEP, maxWidth);
 }
