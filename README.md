@@ -4,19 +4,7 @@ A Node.js statusline for Claude Code. Renders model identity, context runway,
 rate-limit pace, a persistent multi-window cost ledger, and repo and git state
 in four lines. Runs on Windows, macOS and Linux from the same files.
 
-![The statusline rendered in a terminal, above the Claude Code prompt](assets/statusline.png)
-
-A companion script renders the agent panel below the prompt:
-
-![The statusline showing Fable 5 with thinking, caveman and ponytail modes active, above the prompt and the agent panel](assets/statusline-fable.png)
-
-Every field rendered at once:
-
-![Every field rendered at once: model identity with the 1M-context, effort, thinking, fast and plugin tags; context, cache, long-context and both rate-limit windows with pace arrows; the four cost windows with burn rate and API share; repo, branch, working-tree and worktree state; and four agent-panel rows below](assets/statusline-all-fields.png)
-
-Lines run fastest-changing to slowest: context and rate limits move on every
-response, cost moves with them, and branch/working-tree state barely moves
-within a turn - so the repo row sits at the bottom.
+![Four rendered examples. An everyday session on a Pro or Max subscription, with both rate-limit windows cool and one untracked file in the tree. A billed plan (API key, Bedrock, Vertex, Enterprise) where the windows give way to a spend gauge against a $750 monthly allocation and the blended cost per million tokens. The companion subagent statusline, with one row per visible teammate below the prompt. And every field rendered at once: model identity with the 1M-context, effort, thinking, fast and plugin tags; context, cache, long-context and both rate-limit windows with pace arrows; the four cost windows with burn rate and API share; repo, branch, working-tree and worktree state; and the session agent](assets/statusline-overview.png)
 
 |           |                                                                                                                                            |
 | --------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
@@ -38,16 +26,7 @@ statusline.js             the status line above the footer
 subagent-statusline.js    one row per subagent in the agent panel
 install.js                installer, updater and uninstaller in one file
 examples/                 mock payloads, plus a transcript that proves the dedup
-test/run.js               86 assertions, no framework
-test/demo.js              renders every scenario with live timestamps
-```
-
-Try it before installing anything. Both commands are read-only and run against a
-throwaway config directory, so neither touches your real ledger or settings:
-
-```bash
-node test/demo.js     # every scenario, with live pace arrows
-node test/run.js      # 86 passed, 0 failed
+test/run.js               87 assertions, no framework
 ```
 
 ---
@@ -1271,8 +1250,7 @@ The same trust and `disableAllHooks` gates that apply to `statusLine` apply to
 ## Development
 
 ```bash
-node test/run.js       # 86 assertions across all three scripts
-node test/demo.js      # render every scenario with live timestamps
+node test/run.js       # 87 assertions across all three scripts
 node --check statusline.js && node --check subagent-statusline.js && node --check install.js
 ```
 

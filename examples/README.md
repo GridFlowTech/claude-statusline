@@ -32,8 +32,7 @@ fields, change the others to match.
 **`resets_at` is a fixed epoch and will be in the past.** Pace arrows and
 `time until reset` are suppressed for a stale window, so a raw run of
 `payload.json` shows `5h 90%` with nothing after it. That is correct behaviour,
-not a bug. `node test/demo.js` rewrites both timestamps to live values and is
-the right way to see the arrows.
+not a bug. Rewrite both timestamps to live values to see the arrows.
 
 **`transcript.jsonl` is built to prove the dedup.** It holds three distinct
 responses, two of which are written more than once — exactly how a streamed
