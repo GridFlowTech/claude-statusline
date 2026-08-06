@@ -175,12 +175,18 @@ const FABLE_WEEKLY_SHARE = (() => {
 })();
 
 /* ---------------------------------------------------------------------------
- * Git. One subprocess per render, and only when we are actually inside a repo.
+ * Git. At most one subprocess per GIT_CACHE_MS, and only when we are actually
+ * inside a repo.
  * ------------------------------------------------------------------------ */
 
 // A hung git (network filesystem, index.lock contention) must never freeze the
 // status bar. spawnSync kills the child at this deadline.
 const GIT_TIMEOUT_MS = 800;
+
+// How long a `git status` result stays reusable. The render debounce is 300ms,
+// so a busy turn fires renders far faster than a working tree actually changes;
+// see cachedGitState(). Set to 0 to spawn git on every render.
+const GIT_CACHE_MS = 3000;
 
 // Background `git fetch` debounce, per branch. Matches the reference.
 const FETCH_DEBOUNCE_SECONDS = 600;
@@ -478,6 +484,15 @@ function findRepoRoot(startDir) {
 }
 
 /**
+ * The directory git is asked about. Defined once because two call sites depend
+ * on agreeing exactly: updateLedger keys the cache on it, lineRepo reads that
+ * cache back. A disagreement would hand line 4 another directory's branch.
+ */
+function gitCwd(d) {
+  return d?.workspace?.current_dir || d?.cwd || d?.workspace?.project_dir || '';
+}
+
+/**
  * Parse `git status --porcelain=v1 --branch` into a flat summary.
  * @returns {{branch,detached,ahead,behind,staged,modified,untracked}|null}
  */
@@ -589,6 +604,51 @@ function maybeBackgroundFetch(repoRoot, branch, nowSeconds) {
   } catch {
     /* fetch is best-effort; never let it affect the render */
   }
+}
+
+/**
+ * `git status` behind a short-lived cache held in the session's own ledger
+ * record.
+ *
+ * The spawn is the most expensive thing on the render path (~30-60ms on
+ * Windows, against a ~35-50ms process budget for everything else combined), and
+ * Claude Code re-renders on every assistant message, permission-mode change and
+ * vim-mode toggle, debounced at 300ms. A busy turn therefore fires renders
+ * roughly ten times a second against a working tree that has not moved.
+ *
+ * The cache lives in the ledger record rather than in a temp file of its own.
+ * The ledger is already read once and written at most once per render, and it
+ * is keyed by session_id -- the only identifier that is both stable across the
+ * renders of a session and distinct between concurrent sessions in different
+ * repositories. Keying on process.pid instead would change every render and
+ * defeat the cache entirely. Reusing the ledger keeps this at zero extra file
+ * I/O; the cost is that a refresh marks the record dirty, so the ledger is
+ * written at most once per GIT_CACHE_MS instead of only when a cost moves.
+ *
+ * `null` is cached exactly as eagerly as a hit: outside a repo, or with git
+ * absent from PATH, the answer still cost a full spawn to establish.
+ *
+ * @returns {{status:object|null, root:string|null, refreshed:boolean}}
+ */
+function cachedGitState(rec, cwd, nowMs) {
+  const stamp = num(rec.gTs);
+  // `nowMs - stamp >= 0` rejects a timestamp from the future: a clock stepping
+  // backwards (NTP correction, VM resume) would otherwise pin the cache until
+  // it caught up again.
+  const fresh =
+    rec.gDir === cwd && stamp !== null && nowMs - stamp >= 0 && nowMs - stamp < GIT_CACHE_MS;
+  if (fresh) return { status: rec.gSt ?? null, root: rec.gRoot ?? null, refreshed: false };
+
+  const status = gitStatus(cwd);
+  rec.gDir = cwd;
+  rec.gTs = nowMs;
+  rec.gSt = status;
+  // Only the background-fetch debounce needs the repo root, and only on an
+  // attached branch -- but resolving it walks up to 64 directories with an
+  // existsSync each, so it rides the same cache rather than repeating on every
+  // render for the sake of a check that fires once per 600s.
+  rec.gRoot = status && status.branch && !status.detached ? findRepoRoot(cwd) : null;
+  return { status, root: rec.gRoot, refreshed: true };
 }
 
 /* ---------------------------------------------------------------------------
@@ -900,9 +960,17 @@ function saveLedger(file, data) {
 }
 
 /**
- * Record this render's session cost and roll up the historical buckets.
+ * Record this render's session cost and roll up the historical buckets. Also
+ * the one place the ledger file is read and written, so the transcript offset
+ * and the git-status cache both ride along rather than opening files of their
+ * own.
+ *
+ * `git` is undefined -- not null -- when no cache was available; null is the
+ * cached answer for "not a repo". See lineRepo.
+ *
  * @returns {{session:number, day:number, week:number, month:number,
- *            period:number|null, periodEnd:number|null}}
+ *            period:number|null, periodEnd:number|null,
+ *            git:object|null|undefined, gitRoot:string|null|undefined}}
  */
 /**
  * The budget period containing `nowMs`, as `{ start, end }` epoch milliseconds.
@@ -952,6 +1020,62 @@ function budgetWindow(nowMs) {
   return { start, end };
 }
 
+/* ---------------------------------------------------------------------------
+ * Per-day cost buckets
+ * ----------------------------------------------------------------------------
+ * `cost.total_cost_usd` is a running total for the whole session, so the ledger
+ * only ever sees one number per session. The roll-up used to attribute all of
+ * it to the day the session STARTED, which means a session left open across
+ * midnight drops out of D entirely: at 00:20 you can be $6 into today's work
+ * and read `D $0.00`. W and M have the same defect at their own boundaries, it
+ * is just rarer to be looking when one crosses.
+ *
+ * Every render already computes the delta since the last one -- it has to, to
+ * split Fable spend out of a session that switched models mid-way. That same
+ * delta lands in a bucket keyed by the LOCAL calendar date, so the roll-up sums
+ * buckets rather than guessing from a single anchor, and a session that spans a
+ * boundary is split across it instead of landing entirely on one side.
+ *
+ *   days: { '2026-08-06': [total, fableShare] }
+ *
+ * Sub-day windows (a 17:00 budget reset, the Fable window anchored on the
+ * host's `resets_at`) cannot be answered exactly at day granularity. A bucket
+ * that OVERLAPS such a window counts in full: a gauge that overstates the
+ * boundary day is a safer failure than one that silently drops it.
+ * ------------------------------------------------------------------------ */
+
+/** Local calendar date as YYYY-MM-DD. Local rather than UTC because every
+ *  boundary the roll-up compares against is a local midnight. */
+function dayKey(ms) {
+  const t = new Date(ms);
+  const pad = (n) => String(n).padStart(2, '0');
+  return `${t.getFullYear()}-${pad(t.getMonth() + 1)}-${pad(t.getDate())}`;
+}
+
+/** `[start, end)` of a day key as local epoch ms, or null if unparseable.
+ *  Built from date components, so a DST day is 23 or 25 hours and not 24. */
+function dayRange(key) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(key);
+  if (!m) return null;
+  const y = Number(m[1]);
+  const mo = Number(m[2]) - 1;
+  const dd = Number(m[3]);
+  const start = new Date(y, mo, dd).getTime();
+  if (!Number.isFinite(start)) return null;
+  return [start, new Date(y, mo, dd + 1).getTime()];   // Date normalises overflow
+}
+
+/** Accrue `amount` into the bucket for the day containing `nowMs`. */
+function addDay(rec, nowMs, amount, fable) {
+  if (!rec.days || typeof rec.days !== 'object') rec.days = {};
+  const key = dayKey(nowMs);
+  const cur = Array.isArray(rec.days[key]) ? rec.days[key] : [0, 0];
+  rec.days[key] = [
+    (num(cur[0]) ?? 0) + amount,
+    (num(cur[1]) ?? 0) + (fable ? amount : 0),
+  ];
+}
+
 function updateLedger(d) {
   // The id becomes a plain-object key. Refuse anything that could collide with
   // Object.prototype ("__proto__", "constructor") or smuggle odd characters --
@@ -992,21 +1116,48 @@ function updateLedger(d) {
       // practice that is $0 -- the first render lands before the first
       // response does.
       rec = store.sessions[sessionId] = { first: now, last: now, cost, fab: fable ? cost : 0 };
+      addDay(rec, now, cost, fable);
       dirty = true;
     } else {
+      // A record written before per-day buckets existed carries its whole spend
+      // in `cost`. Fold that into the day it started -- the same day the old
+      // roll-up would have counted it against -- so switching to bucket-summing
+      // does not make an in-flight session's history vanish.
+      if (!rec.days || typeof rec.days !== 'object') {
+        rec.days = {};
+        const anchor = num(rec.first) ?? num(rec.last) ?? now;
+        rec.days[dayKey(anchor)] = [num(rec.cost) ?? 0, num(rec.fab) ?? 0];
+        dirty = true;
+      }
+
       const prev = num(rec.cost) ?? 0;
       const best = Math.max(prev, cost);
       // Only rewrite when the number actually moved. At a 300ms debounce this
       // turns most renders into a pure read and keeps the disk quiet.
       if (best !== rec.cost) { rec.cost = best; dirty = true; }
-      // Segregate by DELTA, not by session. /model switches mid-session, and
-      // attributing a whole session to whichever model happened to be active
-      // at the last render would move dollars between buckets retroactively --
-      // a Sonnet session that ends with one Fable turn would land entirely in
-      // the Fable bucket. Only spend that accrued while Fable was the active
-      // model is Fable's.
-      if (fable && best > prev) { rec.fab = (num(rec.fab) ?? 0) + (best - prev); dirty = true; }
+      // Segregate by DELTA, not by session -- for the day bucket and the Fable
+      // bucket alike. /model switches mid-session, and attributing a whole
+      // session to whichever model happened to be active at the last render
+      // would move dollars between buckets retroactively: a Sonnet session that
+      // ends with one Fable turn would land entirely in the Fable bucket. Only
+      // spend that accrued while Fable was the active model is Fable's, and
+      // only spend that accrued today is today's.
+      if (best > prev) {
+        addDay(rec, now, best - prev, fable);
+        if (fable) rec.fab = (num(rec.fab) ?? 0) + (best - prev);
+        dirty = true;
+      }
       if (!num(rec.first)) { rec.first = now; dirty = true; }
+    }
+
+    // Day buckets share the ledger's own retention horizon. Only the session
+    // being touched is swept; every other record is pruned whole, below.
+    for (const key of Object.keys(rec.days)) {
+      const range = dayRange(key);
+      if (!range || range[1] <= now - LEDGER_RETENTION_DAYS * 86400000) {
+        delete rec.days[key];
+        dirty = true;
+      }
     }
 
     // Token accumulation shares the ledger read/write: a separate store would
@@ -1028,6 +1179,25 @@ function updateLedger(d) {
       if (ctx.changed) dirty = true;
     } catch {
       /* keep the payload-only reading established above */
+    }
+
+    // Git state rides the same round-trip, for the same reason the transcript
+    // offset does: a second store would mean a second pair of file operations
+    // per render for the same session. `totals.git` stays undefined on every
+    // path that could not produce a record, and lineRepo reads that as "no
+    // cache available this render" and falls back to a live call.
+    if (GIT_ENABLED) {
+      const cwd = gitCwd(d);
+      if (cwd) {
+        try {
+          const g = cachedGitState(rec, cwd, now);
+          totals.git = g.status;
+          totals.gitRoot = g.root;
+          if (g.refreshed) dirty = true;
+        } catch {
+          /* leave totals.git undefined: lineRepo spawns git itself */
+        }
+      }
     }
 
     if (dirty) rec.last = now;
@@ -1074,22 +1244,46 @@ function updateLedger(d) {
   totals.day = 0;
   totals.week = 0;
   totals.month = 0;
-  for (const rec of Object.values(store.sessions)) {
-    const c = num(rec && rec.cost);
-    const anchor = num(rec && (rec.first ?? rec.last));
-    if (c === null || anchor === null) continue;
-    if (anchor >= startOfToday) totals.day += c;
-    if (anchor >= startOfWeek) totals.week += c;
-    if (anchor >= startOfMonth) totals.month += c;
-    if (win && anchor >= win.start && anchor < win.end) totals.period += c;
-    if (anchor >= fableStart) {
+  // One bucket's contribution. D/W/M all close on a local midnight, so a day
+  // either starts inside them or does not. The budget period and the Fable
+  // window can close at any hour, so a bucket that OVERLAPS them counts in
+  // full -- see the note above dayKey().
+  const addBucket = (start, end, c, f) => {
+    if (start >= startOfToday) totals.day += c;
+    if (start >= startOfWeek) totals.week += c;
+    if (start >= startOfMonth) totals.month += c;
+    if (win && end > win.start && start < win.end) totals.period += c;
+    if (end > fableStart) {
       // Both halves of the ratio come from the same window, so an incomplete
       // ledger (installed mid-week, work done on another machine) skews them
       // together and the Fable SHARE stays roughly right even when neither
       // absolute figure is.
-      totals.fable += num(rec.fab) ?? 0;
+      totals.fable += f;
       totals.fableWindow += c;
     }
+  };
+
+  for (const rec of Object.values(store.sessions)) {
+    const days = rec && rec.days;
+    if (days && typeof days === 'object') {
+      for (const [key, pair] of Object.entries(days)) {
+        const range = dayRange(key);
+        if (!range) continue;
+        const c = num(Array.isArray(pair) ? pair[0] : pair);
+        if (c === null) continue;
+        addBucket(range[0], range[1], c, (Array.isArray(pair) && num(pair[1])) || 0);
+      }
+      continue;
+    }
+
+    // A record this build has never touched, so it has no buckets: fall back to
+    // the whole session total against the day it started. That is exactly what
+    // the roll-up did before buckets existed, and it is what these records were
+    // written to mean. They convert the first time their session renders again.
+    const c = num(rec && rec.cost);
+    const anchor = num(rec && (rec.first ?? rec.last));
+    if (c === null || anchor === null) continue;
+    addBucket(anchor, anchor + 1, c, num(rec.fab) ?? 0);
   }
 
   // A brand-new session that hasn't been flushed yet must still appear in the
@@ -1260,7 +1454,7 @@ const GLYPH = ASCII_ARROWS
  * Symbols follow the reference: a tick when clean, otherwise +N staged,
  * ~N modified, ?N untracked; then unpushed / available-to-pull counts.
  */
-function lineRepo(d, nowSeconds, maxWidth) {
+function lineRepo(d, ledger, nowSeconds, maxWidth) {
   // workspace.repo.name is parsed host-side from the origin remote, so it costs
   // nothing here. It is absent outside a repo or when there is no origin --
   // fall back to the project directory's own name.
@@ -1268,9 +1462,14 @@ function lineRepo(d, nowSeconds, maxWidth) {
   const repoName = cleanText(d?.workspace?.repo?.name) || (dir ? cleanText(path.basename(dir)) : '');
 
   let gitText = '';
-  const cwd = d?.workspace?.current_dir || d?.cwd || dir;
+  const cwd = gitCwd(d);
+  // Resolved during the ledger round-trip so it can be cached across renders
+  // (see cachedGitState). `undefined` means no record was available -- an
+  // unusable session id, or an unwritable ledger path -- in which case this
+  // line pays for the spawn itself rather than losing the branch entirely.
+  const cached = ledger && ledger.git !== undefined;
   if (GIT_ENABLED && cwd) {
-    const st = gitStatus(cwd);
+    const st = cached ? ledger.git : gitStatus(cwd);
     if (st && st.branch) {
       const parts = [dim(GLYPH.branch) + ' ' + magenta(st.branch)];
 
@@ -1291,7 +1490,7 @@ function lineRepo(d, nowSeconds, maxWidth) {
       // background so the numbers keep meaning something, without ever
       // blocking this render.
       if (!st.detached) {
-        const root = findRepoRoot(cwd);
+        const root = cached ? ledger.gitRoot : findRepoRoot(cwd);
         if (root) maybeBackgroundFetch(root, st.branch, nowSeconds);
       }
     }
@@ -1887,7 +2086,7 @@ function main() {
   lines.push(safe(() => lineModel(data, width), 'Claude'));
   lines.push(safe(() => lineUsage(data, ledger, nowSeconds, width), `${dim('Ctx')} 0%`));
   lines.push(safe(() => lineCost(data, ledger, width), money(num(data?.cost?.total_cost_usd) ?? 0)));
-  lines.push(safe(() => lineRepo(data, nowSeconds, width), ''));
+  lines.push(safe(() => lineRepo(data, ledger, nowSeconds, width), ''));
 
   const agentName = data?.agent?.name;
   if (typeof agentName === 'string' && agentName.trim()) {

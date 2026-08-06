@@ -539,6 +539,173 @@ check('CC_STATUSLINE_NOGIT skips git without breaking the line', () => {
   assertNotMatch(r.stdout, '\u2387', 'branch glyph must be absent');
 });
 
+/* --- per-day cost buckets ------------------------------------------------ */
+
+const DAY_MS = 86400000;
+
+/** YYYY-MM-DD in local time, matching dayKey() in the script. */
+function dayKeyOf(ms) {
+  const t = new Date(ms);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${t.getFullYear()}-${p(t.getMonth() + 1)}-${p(t.getDate())}`;
+}
+
+check('a session that spans midnight counts today against today', () => {
+  // The regression this exists for: a session opened yesterday and still
+  // running reported `D $0.00` no matter how much it had spent since midnight,
+  // because the whole session was anchored to the day it started.
+  const id = '00000000-0000-4000-8000-0000000000d1';
+  const y = Date.now() - 25 * 3600 * 1000;
+  const dir = seededSandbox({ [id]: { first: y, last: y, cost: 5 } });
+  const r = run(MAIN, basePayload({ session_id: id, cost: { total_cost_usd: 8 } }), {
+    configDir: dir,
+  });
+  assertMatch(r.stdout, 'D $3.00', 'only the spend since midnight is today');
+  assertMatch(r.stdout, 'W $8.00', 'the whole session is still inside the week');
+});
+
+check('a pre-bucket record is migrated onto the day it started', () => {
+  const id = '00000000-0000-4000-8000-0000000000d2';
+  const y = Date.now() - 25 * 3600 * 1000;
+  const dir = seededSandbox({ [id]: { first: y, last: y, cost: 5 } });
+  run(MAIN, basePayload({ session_id: id, cost: { total_cost_usd: 8 } }), { configDir: dir });
+  const rec = JSON.parse(fs.readFileSync(path.join(dir, LEDGER), 'utf8')).sessions[id];
+  assert(rec.days[dayKeyOf(y)][0] === 5, 'the pre-existing total was not folded onto its own day');
+  assert(rec.days[dayKeyOf(Date.now())][0] === 3, 'the delta did not land on today');
+  assert(rec.cost === 8, 'the running total must still be the session total');
+});
+
+check('an untouched pre-bucket record keeps the old anchored behaviour', () => {
+  // Other sessions are never rewritten, so they must still roll up exactly as
+  // they did before buckets existed: whole cost against the day they started.
+  const y = Date.now() - 25 * 3600 * 1000;
+  const dir = seededSandbox({ yesterday: { first: y, last: y, cost: 7 } });
+  const r = run(MAIN, basePayload(), { configDir: dir });
+  assertMatch(r.stdout, 'D $1.00', "yesterday's session must not leak into today");
+  assertMatch(r.stdout, 'W $8.00', 'but it is still inside the week');
+});
+
+check('buckets are summed per window, not per session', () => {
+  const id = '00000000-0000-4000-8000-0000000000d3';
+  const now = Date.now();
+  const dir = seededSandbox({
+    [id]: {
+      first: now - 3 * DAY_MS, last: now, cost: 10,
+      days: {
+        [dayKeyOf(now - 3 * DAY_MS)]: [7, 0],
+        [dayKeyOf(now)]: [3, 0],
+      },
+    },
+  });
+  const r = run(MAIN, basePayload({ session_id: id, cost: { total_cost_usd: 10 } }), {
+    configDir: dir,
+  });
+  assertMatch(r.stdout, 'D $3.00', 'today is one bucket, not the session total');
+  assertMatch(r.stdout, 'W $10.00', 'the week spans both buckets');
+});
+
+check('a bucket older than the retention horizon is dropped', () => {
+  const id = '00000000-0000-4000-8000-0000000000d4';
+  const old = Date.now() - 60 * DAY_MS;
+  const dir = seededSandbox({
+    [id]: { first: Date.now(), last: Date.now(), cost: 1, days: { [dayKeyOf(old)]: [99, 0] } },
+  });
+  run(MAIN, basePayload({ session_id: id }), { configDir: dir });
+  const rec = JSON.parse(fs.readFileSync(path.join(dir, LEDGER), 'utf8')).sessions[id];
+  assert(rec.days[dayKeyOf(old)] === undefined, 'a 60-day-old bucket survived the sweep');
+});
+
+check('a Fable delta lands in the bucket, not on the whole session', () => {
+  // Half the session was spent on another model, so only the delta observed
+  // while Fable was active may count against the Fable allowance.
+  const id = '00000000-0000-4000-8000-0000000000d5';
+  const dir = seededSandbox({ [id]: { first: Date.now(), last: Date.now(), cost: 4, fab: 0 } });
+  run(MAIN, basePayload({
+    session_id: id,
+    model: { display_name: 'Fable 5' },
+    cost: { total_cost_usd: 10 },
+  }), { configDir: dir });
+  const rec = JSON.parse(fs.readFileSync(path.join(dir, LEDGER), 'utf8')).sessions[id];
+  const today = rec.days[dayKeyOf(Date.now())];
+  assert(today[0] === 10, `today's total should be 10, got ${today[0]}`);
+  assert(today[1] === 6, `only the 6 spent under Fable is Fable's, got ${today[1]}`);
+});
+
+/* --- the git-status cache ------------------------------------------------ */
+
+// A branch name no real checkout will ever have, so its presence in the output
+// proves the cached record was served rather than git re-run.
+const GIT_SENTINEL = 'zz-cache-sentinel';
+
+/** A ledger record whose git cache is fresh and points at this repo. */
+function gitCacheRec(over = {}) {
+  const now = Date.now();
+  return {
+    first: now, last: now, cost: 0,
+    gDir: ROOT, gTs: now, gRoot: ROOT,
+    gSt: {
+      branch: GIT_SENTINEL, detached: false,
+      ahead: 0, behind: 0, staged: 0, modified: 0, untracked: 0,
+    },
+    ...over,
+  };
+}
+
+const gitPayload = (id) => basePayload({
+  session_id: id,
+  workspace: { current_dir: ROOT, project_dir: ROOT },
+});
+
+check('a fresh git cache is served instead of respawning git', () => {
+  const id = '00000000-0000-4000-8000-0000000000c1';
+  const dir = seededSandbox({ [id]: gitCacheRec() });
+  const r = run(MAIN, gitPayload(id), { configDir: dir });
+  assertMatch(r.stdout, GIT_SENTINEL, 'the cached branch must be used verbatim');
+});
+
+check('a stale git cache is refreshed and written back', () => {
+  const id = '00000000-0000-4000-8000-0000000000c2';
+  const dir = seededSandbox({ [id]: gitCacheRec({ gTs: Date.now() - 60000 }) });
+  const r = run(MAIN, gitPayload(id), { configDir: dir });
+  assertNotMatch(r.stdout, GIT_SENTINEL, 'a minute-old entry must not be served');
+  const rec = JSON.parse(fs.readFileSync(path.join(dir, LEDGER), 'utf8')).sessions[id];
+  assert(rec.gTs > Date.now() - 30000, 'the cache timestamp was not refreshed');
+  assert(!rec.gSt || rec.gSt.branch !== GIT_SENTINEL, 'the stale status survived the refresh');
+});
+
+check('a git cache keyed to another directory is not reused', () => {
+  const id = '00000000-0000-4000-8000-0000000000c3';
+  const dir = seededSandbox({ [id]: gitCacheRec({ gDir: os.tmpdir() }) });
+  const r = run(MAIN, gitPayload(id), { configDir: dir });
+  assertNotMatch(r.stdout, GIT_SENTINEL, 'the branch of another directory was served');
+});
+
+check('a git cache stamped in the future is not trusted', () => {
+  // A clock stepping backwards must not pin the cache until it catches up.
+  const id = '00000000-0000-4000-8000-0000000000c4';
+  const dir = seededSandbox({ [id]: gitCacheRec({ gTs: Date.now() + 3600000 }) });
+  const r = run(MAIN, gitPayload(id), { configDir: dir });
+  assertNotMatch(r.stdout, GIT_SENTINEL, 'a future timestamp was accepted as fresh');
+});
+
+check('a cold render records the git cache in the ledger', () => {
+  const id = '00000000-0000-4000-8000-0000000000c5';
+  const dir = sandbox();
+  const r = run(MAIN, gitPayload(id), { configDir: dir });
+  assert(r.status === 0, `exit ${r.status}`);
+  const rec = JSON.parse(fs.readFileSync(path.join(dir, LEDGER), 'utf8')).sessions[id];
+  assert(rec.gDir === ROOT, 'the cache is not keyed on the directory');
+  assert(typeof rec.gTs === 'number', 'no cache timestamp was written');
+});
+
+check('CC_STATUSLINE_NOGIT writes no git cache at all', () => {
+  const id = '00000000-0000-4000-8000-0000000000c6';
+  const dir = sandbox();
+  run(MAIN, gitPayload(id), { configDir: dir, env: { CC_STATUSLINE_NOGIT: '1' } });
+  const rec = JSON.parse(fs.readFileSync(path.join(dir, LEDGER), 'utf8')).sessions[id];
+  assert(rec.gTs === undefined, 'git was consulted despite CC_STATUSLINE_NOGIT');
+});
+
 check('ASCII mode replaces every non-ASCII glyph', () => {
   const r = run(MAIN, basePayload({
     rate_limits: { five_hour: window_(40, 18000, 0.5), seven_day: window_(10, 604800, 0.5) },

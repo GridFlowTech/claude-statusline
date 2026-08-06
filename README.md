@@ -9,12 +9,12 @@ in four lines. Runs on Windows, macOS and Linux from the same files.
 |           |                                                                                                                                            |
 | --------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
 | Install   | One piped command - see [Installation](#installation)                                                                                      |
-| Scripts   | `~/.claude/statusline.js` (1393 lines) · `~/.claude/subagent-statusline.js` (336 lines)                                                    |
+| Scripts   | `~/.claude/statusline.js` (2124 lines) · `~/.claude/subagent-statusline.js` (336 lines)                                                    |
 | Ledger    | `~/.claude/cost_ledger.json` (created on first run)                                                                                        |
 | Config    | `statusLine` and `subagentStatusLine` blocks in `~/.claude/settings.json`                                                                  |
 | Runtime   | Node.js ≥ 14.17 - built-ins only (`fs`, `path`, `os`, `child_process`; `https`/`crypto` lazily, in the optional updater). No dependencies. |
 | Platforms | Windows, macOS, Linux                                                                                                                      |
-| Cost      | ~147 ms per render inside a git repo, ~63 ms outside one. ~66 ms for the subagent panel. No API tokens.                                    |
+| Cost      | ~120 ms for a render that respawns git, ~65 ms for one served from the git cache, ~63 ms outside a repo. ~66 ms for the subagent panel. No API tokens. |
 | Licence   | MIT                                                                                                                                        |
 
 ---
@@ -26,7 +26,7 @@ statusline.js             the status line above the footer
 subagent-statusline.js    one row per subagent in the agent panel
 install.js                installer, updater and uninstaller in one file
 examples/                 mock payloads, plus a transcript that proves the dedup
-test/run.js               87 assertions, no framework
+test/run.js               99 assertions, no framework
 ```
 
 ---
@@ -478,6 +478,42 @@ Header forms handled: normal, `[gone]` upstream, no upstream, `HEAD (no
 branch)`, and `No commits yet on <branch>`. Branch names may legally contain
 dots, so the `...upstream` split takes the **last** occurrence.
 
+### One subprocess per 3 s, not one per render
+
+One spawn is still one spawn, and Claude Code re-renders on every assistant
+message, permission-mode change and vim-mode toggle - debounced at 300 ms, so a
+busy turn fires renders roughly ten times a second against a working tree that
+has not moved. The result is cached for **3 s** (`GIT_CACHE_MS`), which takes a
+warm render down to what it costs with git disabled entirely:
+
+| Render                          | Median  |
+| ------------------------------- | ------- |
+| Cold, or a cache older than 3 s | ~120 ms |
+| Served from the cache           | ~65 ms  |
+| `CC_STATUSLINE_NOGIT=1`         | ~63 ms  |
+
+The cache lives in the **session's own ledger record**, not in a temp file of
+its own. That record is already read once and written at most once per render,
+so this adds no file I/O at all - and it is keyed by `session_id`, the only
+identifier that is both stable across the renders of one session and distinct
+between concurrent sessions in different repositories. `process.pid` changes on
+every render and would defeat the cache entirely.
+
+Four fields carry it: `gDir` (the directory the answer describes), `gTs` (when
+it was taken), `gSt` (the parsed status) and `gRoot` (the repo root, which
+otherwise costs an `existsSync` walk of up to 64 levels on every render for the
+sake of a fetch check that fires once per 600 s).
+
+An entry is discarded when the directory changed, when it is older than 3 s, or
+when its timestamp is in the **future** - a clock stepping backwards (NTP
+correction, VM resume) must not pin the cache until real time catches up.
+
+`null` is cached exactly as eagerly as a hit: outside a repo, or with `git`
+missing from `PATH`, the answer still cost a full spawn to establish.
+
+The one cost is that a refresh marks the ledger record dirty, so the ledger is
+now written at most once per 3 s rather than only when a cost figure moves.
+
 ### Background fetch
 
 Ahead/behind counts are only as fresh as the last `git fetch`. The script kicks
@@ -493,7 +529,9 @@ debounces - otherwise a broken remote means a fetch attempt on every single
 render. The child is detached and `unref`'d, so this process exits immediately
 regardless of how long the fetch takes.
 
-Set `CC_STATUSLINE_NOGIT=1` to skip all of this and reclaim ~79 ms per render.
+Set `CC_STATUSLINE_NOGIT=1` to skip all of this. With the cache in place that
+now only reclaims the ~57 ms of a refresh render, not of every render - and it
+costs you the branch cell permanently.
 
 ---
 
@@ -882,6 +920,15 @@ therefore require local state.
       "first": 1784968584699,
       "last": 1784968839965,
       "cost": 4.1637,
+      "fab": 0.9102,
+      "days": {
+        "2026-08-05": [3.2115, 0],
+        "2026-08-06": [0.9522, 0.9102]
+      },
+      "gDir": "C:/G/repos/claude-statusline",
+      "gTs": 1784968839102,
+      "gRoot": "C:/G/repos/claude-statusline",
+      "gSt": { "branch": "main", "detached": false, "ahead": 0, "behind": 0, "staged": 0, "modified": 2, "untracked": 0 },
       "tPath": "~/.claude/projects/<project>/<session>.jsonl",
       "tOff": 1418150,
       "tId": "msg_011CdNbkFr8oMxSYfne14bEe",
@@ -896,9 +943,13 @@ therefore require local state.
 
 | Field                    | Meaning                                                                                    |
 | ------------------------ | ------------------------------------------------------------------------------------------ |
-| `first`                  | Epoch ms the session was first observed. **The bucketing anchor.**                         |
+| `first`                  | Epoch ms the session was first observed. Only a fallback anchor now - see below.           |
 | `last`                   | Epoch ms of the most recent update. Drives retention pruning.                              |
 | `cost`                   | Highest `total_cost_usd` ever seen for that id.                                            |
+| `fab`                    | Of that total, the part that accrued while Fable was the active model.                     |
+| `days`                   | `YYYY-MM-DD` (local) -> `[total, fableShare]` accrued that day. **The bucketing unit.**    |
+| `gDir` `gTs`             | Directory the cached `git status` describes, and when it was taken.                        |
+| `gSt` `gRoot`            | The cached status itself, and the repo root the fetch debounce needs.                      |
 | `tPath`                  | Transcript this session's token totals were accumulated from.                              |
 | `tOff`                   | Byte offset consumed so far - the incremental read resumes here.                           |
 | `tId`                    | Last counted message id, so streamed duplicates are not recounted across a chunk boundary. |
@@ -916,11 +967,31 @@ session, but a resumed or forked session can briefly report a lower figure
 before its first API call repopulates the field. Taking the max makes the ledger
 immune to that without needing to understand why it happened.
 
-**Bucketed on `first`, never on `last`.** A session that spans midnight would
-otherwise migrate its entire accumulated cost into the new day, and yesterday's
-total would silently shrink. Anchoring on first-seen makes every historical
-bucket stable once written. The tradeoff: a long session started yesterday
-counts wholly toward yesterday.
+**Bucketed per day, not per session.** `total_cost_usd` is a single running
+number for a whole session, so the obvious anchors are both wrong. On `last`, a
+session that spans midnight drags its entire history into the new day and
+yesterday's total silently shrinks. On `first` - what this did until the `days`
+map existed - the same session never contributes to today at all: at 00:20, an
+hour into a session opened yesterday, `D` reads `$0.00` no matter what you have
+spent since midnight.
+
+Neither is fixable by picking the other anchor, so the delta each render already
+computes (it has to, to split Fable spend out of a session that switched models
+part-way) is accrued into a bucket keyed by the local date instead. D/W/M sum
+buckets, a session that spans a boundary is split across it, and historical
+buckets are still immutable once the day is over.
+
+Sub-day windows - a 17:00 budget reset, the Fable window anchored on the host's
+`resets_at` - cannot be answered exactly at day granularity. A bucket that
+**overlaps** such a window counts in full: overstating the boundary day is a
+safer failure for a spend gauge than silently dropping it.
+
+Records written before the `days` map existed keep working. The session being
+rendered has its running total folded onto the day it started - the same day the
+old roll-up credited it to - the first time it renders again; every other record
+falls back to the old anchored behaviour until its own session next appears.
+Nothing is retroactively re-split, because the ledger never stored the
+information needed to do so.
 
 **Writes are atomic and rare.** The file is written to `<path>.<pid>.tmp` and
 then `rename()`d, which replaces atomically on both Win32 and POSIX - a render killed mid-write
@@ -929,7 +1000,9 @@ can never leave truncated JSON behind. And the write is skipped entirely when
 the cost has not moved, so most renders at a 300 ms debounce are pure reads.
 
 Sessions are pruned after 45 days, which covers "current month" from any day of
-the month.
+the month. Day buckets share that horizon: the record being rendered has its
+expired keys swept in the same pass, so a session left open for months cannot
+grow an unbounded map.
 
 ### Resetting
 
