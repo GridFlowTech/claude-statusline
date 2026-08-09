@@ -631,6 +631,247 @@ check('a Fable delta lands in the bucket, not on the whole session', () => {
   assert(today[1] === 6, `only the 6 spent under Fable is Fable's, got ${today[1]}`);
 });
 
+/* --- the OAuth usage endpoint -------------------------------------------- */
+
+// The feature is opt-in via a flag file and refreshes in a DETACHED child, so
+// every case here seeds the cache by hand and stamps the debounce marker fresh.
+// Nothing in this suite may reach the network: the marker suppresses the spawn,
+// and the child would find no credentials in a sandbox anyway -- statusline.js
+// consults the macOS Keychain only when CLAUDE_CONFIG_DIR is unset, which it
+// never is here.
+const USAGE_FLAG = '.statusline-usage';
+const USAGE_CACHE = '.statusline-usage.json';
+const USAGE_MARKER = '.statusline-usage-check';
+
+// $10 spent in the window, $4 of it on Fable -> a 40% share. Against a 20%
+// weekly reading and the default 50% allowance the raw estimate is
+// 20 * 0.4 / 50 * 100 = 16%.
+const RAW_FABLE_PCT = 16;
+
+function fablePayload(id, over = {}) {
+  return basePayload({
+    session_id: id,
+    model: { display_name: 'Fable 5' },
+    cost: { total_cost_usd: 10 },
+    rate_limits: { seven_day: { used_percentage: 20, resets_at: nowSec + 100000 } },
+    ...over,
+  });
+}
+
+/** Two limits in the shape normalizeUsage() writes them. */
+const usageLimits = (percent, severity = 'normal', model = 'Fable') => [
+  { kind: 'weekly_all', percent: 20, severity: 'normal', model: null, resets: null },
+  { kind: 'weekly_scoped', percent, severity, model, resets: null },
+];
+
+function usageSandbox(id, opts = {}) {
+  const { limits, ageMs = 0, flag = true, marker = true, calib } = opts;
+  const now = Date.now();
+  const store = {
+    v: 1,
+    sessions: { [id]: { first: now, last: now, cost: 10, fab: 4, days: { [dayKeyOf(now)]: [10, 4] } } },
+  };
+  if (calib !== undefined) store.fcal = { k: calib, at: now };
+
+  const dir = sandbox();
+  fs.writeFileSync(path.join(dir, LEDGER), JSON.stringify(store), 'utf8');
+  if (flag) fs.writeFileSync(path.join(dir, USAGE_FLAG), 'on\n', 'utf8');
+  if (limits) {
+    fs.writeFileSync(path.join(dir, USAGE_CACHE), JSON.stringify({ v: 1, at: now - ageMs, limits }), 'utf8');
+  }
+  if (marker) fs.writeFileSync(path.join(dir, USAGE_MARKER), 'test\n', 'utf8');
+  return dir;
+}
+
+const readLedger = (dir) => JSON.parse(fs.readFileSync(path.join(dir, LEDGER), 'utf8'));
+
+check('with the flag absent the estimate runs and is marked as one', () => {
+  const id = '00000000-0000-4000-8000-0000000000e1';
+  const dir = usageSandbox(id, { flag: false, limits: usageLimits(8) });
+  const r = run(MAIN, fablePayload(id), { configDir: dir });
+  // The cached snapshot is present and deliberately ignored: opting in is an
+  // on-disk act, and a cache left behind by a previous opt-in must not revive
+  // the feature.
+  assertMatch(r.stdout, `Fable ~${RAW_FABLE_PCT}%`, 'estimate');
+});
+
+check('a correction already learned survives the endpoint being turned off', () => {
+  const id = '00000000-0000-4000-8000-0000000000ef';
+  // The correction lives in the ledger, not in the snapshot, so switching the
+  // endpoint off stops it being UPDATED -- it does not throw it away.
+  const dir = usageSandbox(id, { flag: false, calib: 0.5 });
+  const r = run(MAIN, fablePayload(id), { configDir: dir });
+  assertMatch(r.stdout, `Fable ~${RAW_FABLE_PCT * 0.5}%`, 'calibrated estimate with the flag off');
+});
+
+check('the flag is required before anything is fetched', () => {
+  const id = '00000000-0000-4000-8000-0000000000e2';
+  const dir = usageSandbox(id, { flag: false, marker: false });
+  run(MAIN, fablePayload(id), { configDir: dir });
+  assert(!fs.existsSync(path.join(dir, USAGE_MARKER)), 'a render with no flag armed the refresh');
+});
+
+check('the flag arms exactly one refresh per TTL', () => {
+  const id = '00000000-0000-4000-8000-0000000000e3';
+  const dir = usageSandbox(id, { marker: false });
+  run(MAIN, fablePayload(id), { configDir: dir });
+  assert(fs.existsSync(path.join(dir, USAGE_MARKER)), 'the flag did not arm a refresh');
+
+  // Stamped before the spawn, so the second render inside the TTL stands down.
+  const first = fs.statSync(path.join(dir, USAGE_MARKER)).mtimeMs;
+  run(MAIN, fablePayload(id), { configDir: dir });
+  assert(fs.statSync(path.join(dir, USAGE_MARKER)).mtimeMs === first, 'the marker was re-stamped inside the TTL');
+});
+
+// --- the refresh gate. The endpoint answers for the whole account, but only a
+// model with a scoped bucket has anything to draw from it, so the full 90s
+// cadence is reserved for renders that can use the answer.
+
+const armed = (dir) => fs.existsSync(path.join(dir, USAGE_MARKER));
+
+check('a model with nothing to show does not poll at the full cadence', () => {
+  const id = '00000000-0000-4000-8000-0000000000f1';
+  const dir = usageSandbox(id, { limits: usageLimits(8, 'normal', 'Fable'), marker: false });
+  run(MAIN, fablePayload(id, { model: { display_name: 'Opus 5' } }), { configDir: dir });
+  assert(!armed(dir), 'Opus polled the endpoint for a Fable-only snapshot');
+});
+
+check('a model that DOES have a scoped bucket keeps it fresh', () => {
+  const id = '00000000-0000-4000-8000-0000000000f2';
+  const dir = usageSandbox(id, { limits: usageLimits(3, 'normal', 'Opus'), marker: false });
+  run(MAIN, fablePayload(id, { model: { display_name: 'Opus 5', id: 'claude-opus-5' } }), { configDir: dir });
+  assert(armed(dir), 'a model with its own bucket stopped refreshing it');
+});
+
+check('Fable keeps refreshing even with no bucket cached yet', () => {
+  const id = '00000000-0000-4000-8000-0000000000f3';
+  // Its estimate is calibrated from these very responses, so the request is
+  // worth making whether or not a scoped bucket has turned up.
+  const dir = usageSandbox(id, { limits: [{ kind: 'weekly_all', percent: 20, severity: 'normal', model: null, resets: null }], marker: false });
+  run(MAIN, fablePayload(id), { configDir: dir });
+  assert(armed(dir), 'Fable stopped refreshing');
+});
+
+check('with nothing cached at all, any model bootstraps once', () => {
+  const id = '00000000-0000-4000-8000-0000000000f4';
+  // A model earns a bucket by appearing in a response, so a gate that only ran
+  // for models already known to have one could never discover the first.
+  const dir = usageSandbox(id, { marker: false });
+  run(MAIN, fablePayload(id, { model: { display_name: 'Opus 5' } }), { configDir: dir });
+  assert(armed(dir), 'no snapshot and no bootstrap: the gate can never open');
+});
+
+check('past the freshness horizon any model retries, about once an hour', () => {
+  const id = '00000000-0000-4000-8000-0000000000f5';
+  const dir = usageSandbox(id, {
+    limits: usageLimits(8, 'normal', 'Fable'), ageMs: 2 * 3600 * 1000, marker: false,
+  });
+  run(MAIN, fablePayload(id, { model: { display_name: 'Opus 5' } }), { configDir: dir });
+  assert(armed(dir), 'a snapshot past the horizon was never retried');
+});
+
+check('a fresh snapshot replaces the estimate and drops the tilde', () => {
+  const id = '00000000-0000-4000-8000-0000000000e4';
+  const dir = usageSandbox(id, { limits: usageLimits(8) });
+  const r = run(MAIN, fablePayload(id), { configDir: dir });
+  assertMatch(r.stdout, 'Fable 8%', 'server figure');
+  assertNotMatch(r.stdout, 'Fable ~', 'a measurement must not be drawn as an estimate');
+});
+
+check('the server figure teaches the estimator its own error', () => {
+  const id = '00000000-0000-4000-8000-0000000000e5';
+  const dir = usageSandbox(id, { limits: usageLimits(8) });
+  run(MAIN, fablePayload(id), { configDir: dir });
+  // 8 observed against 16 estimated. First sample, so it is taken whole.
+  const k = readLedger(dir).fcal.k;
+  assert(Math.abs(k - 0.5) < 1e-9, `expected k=0.5, got ${k}`);
+});
+
+check('a stale snapshot falls back to the CALIBRATED estimate', () => {
+  const id = '00000000-0000-4000-8000-0000000000e6';
+  // Two hours old: past the one-hour horizon, so it is no longer a measurement.
+  const dir = usageSandbox(id, { limits: usageLimits(8), ageMs: 2 * 3600 * 1000, calib: 0.5 });
+  const r = run(MAIN, fablePayload(id), { configDir: dir });
+  assertMatch(r.stdout, `Fable ~${RAW_FABLE_PCT * 0.5}%`, 'calibrated fallback');
+});
+
+check('a stale snapshot does not re-teach the estimator', () => {
+  const id = '00000000-0000-4000-8000-0000000000e7';
+  const dir = usageSandbox(id, { limits: usageLimits(99), ageMs: 2 * 3600 * 1000 });
+  run(MAIN, fablePayload(id), { configDir: dir });
+  assert(readLedger(dir).fcal === undefined, 'a stale figure was used as ground truth');
+});
+
+check('a scoped bucket for another model is not claimed by this one', () => {
+  const id = '00000000-0000-4000-8000-0000000000e8';
+  const dir = usageSandbox(id, { limits: usageLimits(8, 'normal', 'Fable') });
+  // Opus is not Fable: no scoped match, and the estimator is Fable-only, so the
+  // cell collapses rather than reporting another model's allowance.
+  const r = run(MAIN, fablePayload(id, { model: { display_name: 'Opus 5' } }), { configDir: dir });
+  assertNotMatch(r.stdout, 'Fable', 'a Fable bucket was attributed to Opus');
+  assertNotMatch(r.stdout, ' 8%', 'a Fable bucket was attributed to Opus');
+});
+
+check('the scope is matched by family, not by exact name', () => {
+  const id = '00000000-0000-4000-8000-0000000000e9';
+  const dir = usageSandbox(id, { limits: usageLimits(3, 'normal', 'Opus') });
+  const r = run(MAIN, fablePayload(id, {
+    model: { display_name: 'Claude Opus 5 (1M context)', id: 'claude-opus-5' },
+  }), { configDir: dir });
+  assertMatch(r.stdout, 'Opus 3%', 'server name "Opus" against a full display string');
+});
+
+check('severity can only make the cell more alarming, never less', () => {
+  const id = '00000000-0000-4000-8000-0000000000ea';
+  const dir = usageSandbox(id, { limits: usageLimits(3, 'critical') });
+  const r = run(MAIN, fablePayload(id), { configDir: dir, env: { NO_COLOR: '' } });
+  // Raw control bytes are banned from source here (see .gitattributes), so the
+  // escape is built rather than typed.
+  assertMatch(r.stdout, `${String.fromCharCode(27)}[38;5;203m3%`,
+    '3% is green by threshold; critical must override it');
+});
+
+check('a cached model name cannot smuggle escape sequences into the terminal', () => {
+  const id = '00000000-0000-4000-8000-0000000000eb';
+  // The cache lives in a shared config dir, so its contents are untrusted on
+  // the way back in. The family word stays clean so the scope still MATCHES --
+  // what is under test is that the label is sanitised, not that a hostile name
+  // is rejected outright.
+  const ESC = String.fromCharCode(27);
+  const dir = usageSandbox(id, { limits: usageLimits(8, 'normal', `Fable ${ESC}[31mX`) });
+  const r = run(MAIN, fablePayload(id), { configDir: dir });
+  assert(!r.stdout.includes(ESC), `an escape reached stdout: ${JSON.stringify(r.stdout)}`);
+  assertMatch(r.stdout, '8%', 'the figure itself still renders');
+});
+
+check('an oversized or corrupt cache is ignored, not fatal', () => {
+  const id = '00000000-0000-4000-8000-0000000000ec';
+  const dir = usageSandbox(id, { limits: usageLimits(8) });
+  fs.writeFileSync(path.join(dir, USAGE_CACHE), '{ not json at all', 'utf8');
+  const r = run(MAIN, fablePayload(id), { configDir: dir });
+  assert(r.status === 0, `exit ${r.status}`);
+  assertMatch(r.stdout, `Fable ~${RAW_FABLE_PCT}%`, 'fell back to the estimate');
+});
+
+check('CC_STATUSLINE_USAGE=0 overrides the flag file', () => {
+  const id = '00000000-0000-4000-8000-0000000000ed';
+  const dir = usageSandbox(id, { limits: usageLimits(8), marker: false });
+  const r = run(MAIN, fablePayload(id), { configDir: dir, env: { CC_STATUSLINE_USAGE: '0' } });
+  assertMatch(r.stdout, `Fable ~${RAW_FABLE_PCT}%`, 'kill switch');
+  assert(!fs.existsSync(path.join(dir, USAGE_MARKER)), 'the kill switch still armed a refresh');
+});
+
+check('the refresh child writes nothing when it cannot find a credential', () => {
+  const dir = usageSandbox('00000000-0000-4000-8000-0000000000ee', {});
+  const res = spawnSync(process.execPath, [MAIN, '--usage-refresh'], {
+    encoding: 'utf8',
+    env: { ...process.env, CLAUDE_CONFIG_DIR: dir },
+  });
+  assert(res.status === 0, `exit ${res.status}`);
+  assert(res.stdout === '', `the child printed ${JSON.stringify(res.stdout)}`);
+  assert(!fs.existsSync(path.join(dir, USAGE_CACHE)), 'a cache was written without a credential');
+});
+
 /* --- the git-status cache ------------------------------------------------ */
 
 // A branch name no real checkout will ever have, so its presence in the output

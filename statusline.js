@@ -11,7 +11,9 @@
  *   only ever require() built-ins (fs / path / os) -- no module resolution walk
  *   and no network on the render path. One synchronous stdout write at the end.
  *   `https` and `crypto` are required lazily, inside the detached self-update
- *   child only, so a normal render never pays for loading them.
+ *   and usage-refresh children only, so a normal render never pays for loading
+ *   them -- and neither child can delay a frame, because both are spawned after
+ *   stdout has already been written.
  *
  * CONTRACT
  *   stdin  : one JSON object (schema: https://code.claude.com/docs/en/statusline)
@@ -156,14 +158,10 @@ const BUDGET_OFFSET = (() => {
  * plan the cell simply collapses, which is correct: a billed account has no
  * Fable allowance to pace against, only dollars, and `Bgt` already covers those.
  *
- * The upstream ccstatusline reads this figure straight from the server, which
- * returns a per-model weekly bucket already normalised against the Fable
- * allowance. That endpoint is not reachable from here: it needs OAuth and a
- * network round trip, and this file does neither on the render path. The
- * statusline payload carries no model-scoped bucket either -- `rate_limits` is
- * exactly `five_hour` and `seven_day` -- so the local estimate below is the
- * only option, and the share is the one number in it that is an assumption
- * rather than a measurement, which is why it is the only knob.
+ * The statusline payload carries no model-scoped bucket -- `rate_limits` is
+ * exactly `five_hour` and `seven_day` -- so this estimate is what runs whenever
+ * the server's own figure is unavailable. See the usage-endpoint section below
+ * for where that figure comes from and how it retires the guesswork here.
  * ------------------------------------------------------------------------ */
 
 // Percent of the weekly subscription limit Fable 5 may consume. A product
@@ -173,6 +171,127 @@ const FABLE_WEEKLY_SHARE = (() => {
   const n = Number(process.env.CC_STATUSLINE_FABLE_SHARE);
   return Number.isFinite(n) && n > 0 && n <= 100 ? n : 50;
 })();
+
+/* ---------------------------------------------------------------------------
+ * Ground truth: the OAuth usage endpoint
+ * ----------------------------------------------------------------------------
+ * `GET https://api.anthropic.com/api/oauth/usage`, with the same OAuth bearer
+ * Claude Code itself holds, answers the question the payload cannot:
+ *
+ *   "limits": [
+ *     { "kind": "session",        "percent": 10, "severity": "normal", ... },
+ *     { "kind": "weekly_all",     "percent":  7, "severity": "normal", ... },
+ *     { "kind": "weekly_scoped",  "percent":  2, "severity": "normal",
+ *       "scope": { "model": { "display_name": "Fable" } } }
+ *   ]
+ *
+ * `weekly_scoped` is the per-model weekly bucket, server-side and already
+ * expressed as a percentage of that model's own allowance. It is a measurement
+ * where fableCell()'s dollar ratio is an inference, so when it is available it
+ * simply wins. (The older `seven_day_opus` / `seven_day_sonnet` top-level fields
+ * are null on current accounts; `limits[]` is the live shape and the only one
+ * read here.)
+ *
+ * It costs NO tokens -- there is no inference behind it, it is account
+ * metadata -- but it does cost a TLS round trip, and the render path is
+ * forbidden from doing network I/O for the same reason it is forbidden from
+ * doing four git spawns: Claude Code re-renders on a 300ms debounce and a
+ * stalled render is a stuttering status bar. So the split mirrors the
+ * self-update feature:
+ *
+ *   render path   one statSync on a marker + one small readFileSync. When the
+ *                 marker is older than the TTL it is touched and a DETACHED
+ *                 child is spawned. This render uses whatever was already
+ *                 cached; it never waits.
+ *   detached child  reads the credential, makes the request, writes the cache,
+ *                 exits. Nothing it does can delay a frame.
+ *
+ * The marker is stamped BEFORE the spawn, so a failing request (offline, 401,
+ * rate limited) still debounces for a full TTL instead of re-arming on every
+ * render.
+ *
+ * OFF unless <config>/.statusline-usage exists, on the same terms as the
+ * self-updater and for the same reason: this is a status bar reaching out to
+ * the network with the user's credential, and nothing a status bar does should
+ * surprise anyone. `install.js --usage` creates the flag, `--no-usage` removes
+ * it. While it is absent the whole feature costs one statSync per render and
+ * fableCell() behaves exactly as it did before this existed.
+ *
+ *   install.js --usage           opt in
+ *   CC_STATUSLINE_USAGE=0        force off even with the flag present
+ *   CC_STATUSLINE_USAGE_TTL=90   seconds between refreshes
+ * ------------------------------------------------------------------------ */
+
+const USAGE_FLAG_FILE = '.statusline-usage';
+
+// The env var is a kill switch, not the switch: it can only turn the feature
+// off. Opting IN is a deliberate on-disk act, so that a stray environment
+// variable inherited from somewhere can never start network traffic.
+const USAGE_DISABLED = process.env.CC_STATUSLINE_USAGE === '0';
+
+// Seconds between refresh attempts. The seven-day bucket this feeds moves by
+// single-digit percent per DAY, so anything under a minute is pure waste; the
+// floor exists to stop a typo turning the bar into a polling loop against a
+// production endpoint.
+const USAGE_TTL_MS = (() => {
+  const n = Number(process.env.CC_STATUSLINE_USAGE_TTL);
+  const seconds = Number.isFinite(n) && n > 0 ? n : 90;
+  return clamp(seconds, 60, 600) * 1000;
+})();
+
+// Past this age the cached figure stops being treated as ground truth and the
+// local estimate takes over. An hour of drift on a seven-day window is small,
+// but an hour without a successful refresh means something is actually broken
+// (revoked token, no network), and silently presenting a stale measurement as
+// current is the one failure mode worse than presenting an estimate.
+const USAGE_MAX_AGE_MS = 60 * 60 * 1000;
+
+const USAGE_HOST = 'api.anthropic.com';
+const USAGE_PATH = '/api/oauth/usage';
+const USAGE_BETA = 'oauth-2025-04-20';
+const USAGE_TIMEOUT_MS = 10000;
+const USAGE_MAX_BYTES = 256 * 1024;   // the real response is ~1.5 KB
+const USAGE_CACHE_FILE = '.statusline-usage.json';
+const USAGE_CHECK_FILE = '.statusline-usage-check';
+
+/* ---------------------------------------------------------------------------
+ * Estimator calibration
+ * ----------------------------------------------------------------------------
+ * Every render that has BOTH the server's figure and the local estimate can
+ * measure how wrong the estimate is, and that ratio is worth keeping: it is
+ * exactly what the estimate needs the next time the server's figure is missing.
+ *
+ *   k = serverPercent / estimatedPercent
+ *
+ * This is deliberately a learned constant rather than a hand-tuned one. The
+ * estimate's error is the product of several unknowns at once -- whether the
+ * server normalises `weekly_scoped` against the Fable allowance or against the
+ * whole weekly limit, how a Fable dollar maps to limit units against a Sonnet
+ * dollar, and the model mix and reasoning effort this particular account
+ * actually runs at. Guessing any of them wrong bakes in a permanent bias;
+ * measuring their combined effect gets all of them at once and re-measures
+ * whenever the account's habits change.
+ *
+ * Smoothed rather than replaced, because a single sample carries the noise of
+ * whatever the ledger happened to miss (work on another machine, a session
+ * started before install). Persisted in the ledger, which is already read and
+ * written once per render, so it costs no extra file I/O.
+ * ------------------------------------------------------------------------ */
+
+// Weight of the newest observation. Low enough that one bad sample cannot move
+// the bar much, high enough to converge within an hour of renders.
+const CALIB_ALPHA = 0.25;
+
+// Both percentages must be at least this large before their ratio means
+// anything. At 0.4% against 0.3% the quotient is dominated by rounding, and a
+// ratio learned there would be nonsense carried for the rest of the window.
+const CALIB_MIN_PCT = 2;
+
+// Hard bounds. A correction outside these is not a calibration, it is a bug or
+// a schema change, and clamping keeps the fallback merely wrong rather than
+// absurd.
+const CALIB_MIN_K = 0.2;
+const CALIB_MAX_K = 5;
 
 /* ---------------------------------------------------------------------------
  * Git. At most one subprocess per GIT_CACHE_MS, and only when we are actually
@@ -271,6 +390,12 @@ function readStdin() {
  * Small helpers
  * ------------------------------------------------------------------------ */
 
+/** Constrain `v` to [lo, hi]. A declaration, not an arrow, so the tunables
+ *  above may use it despite being evaluated first. */
+function clamp(v, lo, hi) {
+  return Math.min(hi, Math.max(lo, v));
+}
+
 /** Coerce to a finite number, else null. Guards against null/""/NaN/"abc". */
 function num(v) {
   if (v === null || v === undefined || v === '') return null;
@@ -322,6 +447,42 @@ function isFableModel(d) {
 /** Honors CLAUDE_CONFIG_DIR the same way Claude Code and both plugins do. */
 function claudeDir() {
   return process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
+}
+
+/**
+ * Spawn `statusline.js <flag>` detached, at most once per `intervalMs`, using
+ * the mtime of `<config>/<markerFile>` as the debounce.
+ *
+ * Both background jobs -- the self-updater and the usage refresh -- want
+ * exactly this, and they want it to behave IDENTICALLY. The marker is stamped
+ * BEFORE the spawn, never after: two renders can overlap inside the 300ms
+ * debounce, and a job that fails must still wait out the interval rather than
+ * re-arming on every render for the rest of it.
+ *
+ * Never throws, and is only ever called after stdout has been written, so
+ * nothing here can delay or disturb a frame.
+ */
+function spawnDebounced(markerFile, intervalMs, flag) {
+  try {
+    const marker = path.join(claudeDir(), markerFile);
+    const stamp = fs.statSync(marker, { throwIfNoEntry: false });
+    // `age >= 0` rejects a stamp from the future: a clock stepping backwards
+    // (NTP correction, VM resume, a restored backup) would otherwise pin the
+    // job until real time caught up again.
+    const age = stamp ? Date.now() - stamp.mtimeMs : Infinity;
+    if (age >= 0 && age < intervalMs) return;
+
+    fs.mkdirSync(path.dirname(marker), { recursive: true });
+    fs.writeFileSync(marker, new Date().toISOString() + '\n');
+
+    require('child_process')
+      .spawn(process.execPath, [__filename, flag], {
+        detached: true, stdio: 'ignore', windowsHide: true,
+      })
+      .unref();   // let this process exit while the child carries on
+  } catch {
+    /* a background job that cannot start is no reason to disturb the bar */
+  }
 }
 
 /* ---------------------------------------------------------------------------
@@ -1076,6 +1237,27 @@ function addDay(rec, nowMs, amount, fable) {
   ];
 }
 
+/**
+ * The shape every line builder reads. Defined once because updateLedger() fills
+ * it in and main() needs an identical fallback for the case where updateLedger
+ * itself throws -- a field added to one and forgotten in the other is a silent
+ * `undefined` reaching a gauge.
+ *
+ * `scoped` / `weekly` / `snapshotAt` are the usage endpoint's answer and `calib`
+ * the correction learned from it. All four stay null while the feature is off,
+ * which is what makes fableCell() fall straight back to the behaviour it had
+ * before the endpoint existed.
+ */
+function emptyTotals(cost, context) {
+  return {
+    session: cost, day: cost, week: cost, month: cost,
+    tokens: null, period: null, periodEnd: null,
+    fable: 0, fableWindow: 0,
+    scoped: null, weekly: null, calib: null, snapshotAt: null,
+    context,
+  };
+}
+
 function updateLedger(d) {
   // The id becomes a plain-object key. Refuse anything that could collide with
   // Object.prototype ("__proto__", "constructor") or smuggle odd characters --
@@ -1087,14 +1269,9 @@ function updateLedger(d) {
   }
   const cost = num(d?.cost?.total_cost_usd) ?? 0;
   const fable = isFableModel(d);
-  const totals = {
-    session: cost, day: cost, week: cost, month: cost,
-    tokens: null, period: null, periodEnd: null,
-    fable: 0, fableWindow: 0,
-    // Resolved from the payload alone for now. Every early return below still
-    // hands back a usable context reading rather than an implicit zero.
-    context: contextState(d, null),
-  };
+  // The context is resolved from the payload alone for now, so every early
+  // return below still hands back a usable reading rather than an implicit zero.
+  const totals = emptyTotals(cost, contextState(d, null));
 
   let file;
   try { file = ledgerPath(); } catch { return totals; }
@@ -1297,6 +1474,51 @@ function updateLedger(d) {
     if (win) totals.period += cost;
   }
 
+  // --- ground truth, and what it teaches the estimator --------------------
+  //
+  // Folded into the ledger round-trip rather than done in fableCell(), for two
+  // reasons: the correction has to be PERSISTED to be worth learning, and this
+  // is the one function that already holds an open, write-tracked store.
+  //
+  // The correction is read back unconditionally, OUTSIDE the feature check: it
+  // is ledger data, not endpoint data, and a render with no snapshot -- offline,
+  // token expired, endpoint switched back off -- is exactly the render that
+  // needs it. Only the LEARNING half depends on the endpoint being on.
+  const prev = num(store.fcal && store.fcal.k);
+  totals.calib = prev;
+
+  if (usageEnabled()) {
+    const snap = readUsageSnapshot();
+    // Kept whether or not the snapshot is still fresh: the refresh gate needs
+    // its AGE to decide, and re-reading the file after the render would be a
+    // second round-trip for something already in hand.
+    totals.snapshotAt = num(snap && snap.at);
+    if (usageFresh(snap, now)) Object.assign(totals, pickUsage(snap, d));
+
+    const truthPct = num(totals.scoped && totals.scoped.percent);
+    // Uncalibrated on purpose: this is the raw estimate whose error is being
+    // measured, so feeding the correction back into it would drive k to 1 and
+    // learn nothing.
+    const rawPct = rawFablePct(d, totals);
+
+    if (truthPct !== null && rawPct !== null &&
+        truthPct >= CALIB_MIN_PCT && rawPct >= CALIB_MIN_PCT) {
+      // Clamp the OBSERVATION before it is blended, not just the result: one
+      // absurd sample would otherwise drag the smoothed value for many renders.
+      const obs = clamp(truthPct / rawPct, CALIB_MIN_K, CALIB_MAX_K);
+      const next = prev === null ? obs : prev * (1 - CALIB_ALPHA) + obs * CALIB_ALPHA;
+      const k = clamp(next, CALIB_MIN_K, CALIB_MAX_K);
+      totals.calib = k;
+      // The bar rounds to whole percent, so a move this small can never change
+      // what is drawn -- and at a 300ms debounce, writing it anyway would mean
+      // a ledger flush on every single render forever.
+      if (prev === null || Math.abs(k - prev) > 0.002) {
+        store.fcal = { k, at: now };
+        dirty = true;
+      }
+    }
+  }
+
   if (dirty) saveLedger(file, store);
   return totals;
 }
@@ -1388,6 +1610,341 @@ function untilReset(resetsAt, nowSeconds) {
   const resets = num(resetsAt);
   if (resets === null) return '';
   return fmtSpan(resets - nowSeconds);
+}
+
+/* ---------------------------------------------------------------------------
+ * Usage endpoint: render-path half
+ * ----------------------------------------------------------------------------
+ * Everything here is synchronous, allocation-light, and does no network I/O.
+ * See the header block near the top for why the work is split this way.
+ * ------------------------------------------------------------------------ */
+
+function usageCachePath() { return path.join(claudeDir(), USAGE_CACHE_FILE); }
+
+/**
+ * Is the feature switched on? One statSync, and the only cost when it is off.
+ *
+ * Memoised because two callers ask (the ledger pass and the refresh check) and
+ * a flag file cannot change inside the lifetime of a single render.
+ */
+let usageEnabledCache = null;
+function usageEnabled() {
+  if (usageEnabledCache !== null) return usageEnabledCache;
+  let on = false;
+  if (!USAGE_DISABLED) {
+    try {
+      on = fs.statSync(path.join(claudeDir(), USAGE_FLAG_FILE), { throwIfNoEntry: false }) !== undefined;
+    } catch {
+      on = false;
+    }
+  }
+  usageEnabledCache = on;
+  return on;
+}
+
+// Everything the child writes is already sanitised, but the cache is a file in
+// a shared config directory and anything that can write it gets a string into
+// the user's terminal on the next render. So the read side re-checks rather
+// than trusting its own past output -- the same stance readFlagFile() takes.
+const USAGE_CACHE_MAX_BYTES = 64 * 1024;
+
+/**
+ * The last snapshot the detached child wrote, or null.
+ *
+ * Shape is fixed by normalizeUsage() below -- this side never sees the raw
+ * response body, so a schema change upstream cannot reach the renderer as
+ * anything but a missing field.
+ */
+function readUsageSnapshot() {
+  try {
+    const file = usageCachePath();
+    // lstat, not stat: refuse a symlink, and refuse a file large enough to be
+    // something other than the ~400 bytes this cache actually is.
+    const st = fs.lstatSync(file, { throwIfNoEntry: false });
+    if (!st || !st.isFile() || st.isSymbolicLink() || st.size > USAGE_CACHE_MAX_BYTES) return null;
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (parsed && typeof parsed === 'object' && Array.isArray(parsed.limits)) return parsed;
+  } catch {
+    /* absent until the first successful refresh; corrupt means the same thing */
+  }
+  return null;
+}
+
+/** Is this snapshot recent enough to be presented as a measurement? */
+function usageFresh(snap, nowMs) {
+  const at = num(snap?.at);
+  // A stamp from the future is a clock that stepped, not a fresh snapshot.
+  return at !== null && nowMs - at >= 0 && nowMs - at <= USAGE_MAX_AGE_MS;
+}
+
+/**
+ * The two buckets the bar reads, found in one pass: `{ scoped, weekly }`, keyed
+ * to match the fields on the ledger's return value so the caller can assign
+ * them straight across.
+ *
+ * `weekly` is the account-wide `weekly_all` figure. `scoped` is the
+ * `weekly_scoped` bucket belonging to the model THIS render is for, and the two
+ * ends write that model's name differently: the server sends a FAMILY
+ * ("Fable"), the payload a full display string ("Claude Fable 5") plus an id
+ * ("claude-fable-5"). So the match is the server's first word appearing
+ * anywhere in either payload field, case-insensitively -- equality would miss
+ * every real pairing, and matching the payload's words against the server would
+ * make "Claude" match a scope named "Claude Code".
+ *
+ * Deliberately not gated on isFableModel(): the endpoint scopes by model, and
+ * if the account ever gets a scoped bucket for something else, the cell should
+ * report that too rather than staying blank because of a hard-coded name.
+ */
+function pickUsage(snap, d) {
+  const name = `${String(d?.model?.display_name ?? '')} ${String(d?.model?.id ?? '')}`.toLowerCase();
+  const out = { scoped: null, weekly: null };
+
+  for (const l of Array.isArray(snap?.limits) ? snap.limits : []) {
+    if (!l) continue;
+    if (l.kind === 'weekly_all') {
+      if (!out.weekly) out.weekly = l;   // first wins; duplicates are not ours
+      continue;
+    }
+    if (out.scoped || l.kind !== 'weekly_scoped' || typeof l.model !== 'string') continue;
+    const family = l.model.trim().split(/\s+/)[0];
+    if (family && name.includes(family.toLowerCase())) out.scoped = l;
+  }
+
+  return out;
+}
+
+/** A model name that arrived over the network, reduced to something safe to
+ *  print. Shared by the cache writer and the renderer so the two can never
+ *  disagree about what "sanitised" means. */
+function modelLabel(raw) {
+  return typeof raw === 'string' ? raw.replace(/[^\w .+-]/g, '').trim().slice(0, 24) : '';
+}
+
+/**
+ * Is a refresh worth making a request for, on THIS model?
+ *
+ * The endpoint answers for the whole account, but the bar only draws a figure
+ * for a model that has a scoped bucket. Polling every 90s while on a model that
+ * has none is traffic bought for nothing, so the full cadence is reserved for
+ * renders that can actually use the answer.
+ *
+ * Standing down entirely would be a trap, though: a model gets a scoped bucket
+ * by appearing in the response, and a gate that only refreshes for models
+ * already known to have one could never discover the first. Hence the two
+ * escape hatches below -- with no snapshot at all, and once an hour after that,
+ * the request goes out regardless of model. That is enough to find a bucket
+ * Anthropic adds later, at roughly 1/40th the traffic of the full cadence.
+ *
+ * @param t the ledger round-trip's return value, for the snapshot it already read
+ */
+function usageWorthRefreshing(d, t) {
+  const at = num(t?.snapshotAt);
+  if (at === null) return true;                          // nothing cached yet
+  if (Date.now() - at > USAGE_MAX_AGE_MS) return true;   // slow rediscovery
+  // A fresh snapshot exists: only keep it fresh if this model reads from it.
+  // isFableModel covers the case where the bar would fall back to the estimate,
+  // which is calibrated from exactly these responses.
+  return t?.scoped != null || isFableModel(d);
+}
+
+/**
+ * Kick off a detached refresh if the marker has aged past the TTL.
+ *
+ * Called only AFTER stdout has been written, so even the spawn cannot delay a
+ * frame. Never throws: a status bar that fails because a usage figure could not
+ * be refreshed would be a strictly worse product than one showing an estimate.
+ */
+function maybeRefreshUsage(d, t) {
+  try {
+    if (!usageEnabled() || !usageWorthRefreshing(d, t)) return;
+    spawnDebounced(USAGE_CHECK_FILE, USAGE_TTL_MS, '--usage-refresh');
+  } catch {
+    /* best effort, always */
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * Usage endpoint: detached-child half
+ * ----------------------------------------------------------------------------
+ * Nothing below runs on the render path. It may take as long as it likes, and
+ * every failure mode is "leave the previous cache alone".
+ * ------------------------------------------------------------------------ */
+
+/** Pull the OAuth access token out of a credentials blob, or null. */
+function tokenFrom(blob) {
+  const tok = blob?.claudeAiOauth?.accessToken;
+  // Printable ASCII, no spaces: this value goes into an HTTP header, and the
+  // charset check is what makes header injection impossible rather than
+  // merely unlikely.
+  return typeof tok === 'string' && /^[\x21-\x7e]{20,4096}$/.test(tok) ? tok : null;
+}
+
+/**
+ * The live OAuth access token, or null.
+ *
+ * Two stores, because Claude Code uses two:
+ *
+ *   Windows / Linux   <config>/.credentials.json, plain JSON on disk.
+ *   macOS             the login Keychain, under "Claude Code-credentials".
+ *                     `security find-generic-password -w` is the only way in,
+ *                     and the FIRST call raises a Keychain prompt naming
+ *                     /usr/bin/security. Answer "Always Allow" once and it
+ *                     never appears again. That prompt is exactly why this
+ *                     runs in the detached child and never on the render path:
+ *                     a blocking dialog here would freeze the status bar.
+ *
+ * The Keychain is consulted only when CLAUDE_CONFIG_DIR is unset. A caller that
+ * pointed us at a specific config directory means the credentials in THAT
+ * directory -- honouring that is what keeps the test suite (and anyone running
+ * a sandboxed config) from reaching the real account.
+ *
+ * The token is returned, used once, and never stored, logged or written to the
+ * cache. Nothing else in this file ever sees it.
+ */
+function readOauthToken() {
+  try {
+    const file = path.join(claudeDir(), '.credentials.json');
+    // lstat, not stat: refuse a symlink pointing somewhere we did not intend to
+    // read, on the same terms as the plugin flag files.
+    const st = fs.lstatSync(file, { throwIfNoEntry: false });
+    if (st && st.isFile() && !st.isSymbolicLink() && st.size <= 64 * 1024) {
+      const tok = tokenFrom(JSON.parse(fs.readFileSync(file, 'utf8')));
+      if (tok) return tok;
+    }
+  } catch {
+    /* fall through to the platform store */
+  }
+
+  if (process.platform === 'darwin' && !process.env.CLAUDE_CONFIG_DIR) {
+    try {
+      const res = require('child_process').spawnSync(
+        '/usr/bin/security',
+        ['find-generic-password', '-s', 'Claude Code-credentials', '-w'],
+        { encoding: 'utf8', timeout: 30000 }
+      );
+      if (res && !res.error && res.status === 0 && typeof res.stdout === 'string') {
+        return tokenFrom(JSON.parse(res.stdout));
+      }
+    } catch {
+      /* no Keychain entry, or the user declined the prompt */
+    }
+  }
+
+  return null;
+}
+
+/** GET the usage endpoint. Resolves the parsed body, or null on any failure. */
+function fetchUsage(token) {
+  return new Promise((resolve) => {
+    let req;
+    try {
+      req = require('https').request(
+        {
+          host: USAGE_HOST,
+          port: 443,
+          path: USAGE_PATH,
+          method: 'GET',
+          headers: {
+            Authorization: `Bearer ${token}`,
+            'anthropic-beta': USAGE_BETA,
+            Accept: 'application/json',
+            'User-Agent': 'claude-statusline',
+          },
+        },
+        (res) => {
+          // Redirects are deliberately NOT followed. This request carries a
+          // bearer token; following a 302 would hand that credential to
+          // whatever host the redirect names. The self-updater follows
+          // redirects because it sends no credential at all -- the two are not
+          // comparable and must not share a fetch helper.
+          if (res.statusCode !== 200) { res.resume(); return resolve(null); }
+
+          const chunks = [];
+          let total = 0;
+          res.on('data', (c) => {
+            total += c.length;
+            if (total > USAGE_MAX_BYTES) { res.destroy(); return resolve(null); }
+            chunks.push(c);
+          });
+          res.on('end', () => {
+            try { resolve(JSON.parse(Buffer.concat(chunks).toString('utf8'))); }
+            catch { resolve(null); }
+          });
+          res.on('error', () => resolve(null));
+        }
+      );
+    } catch {
+      return resolve(null);
+    }
+    req.setTimeout(USAGE_TIMEOUT_MS, () => req.destroy());
+    req.on('error', () => resolve(null));
+    req.end();
+  });
+}
+
+const USAGE_SEVERITIES = new Set(['normal', 'warning', 'critical', 'exceeded']);
+
+/**
+ * Reduce the response to the few fields the bar draws, sanitised.
+ *
+ * Two jobs. The obvious one is size: the real body carries a dozen null
+ * codenamed buckets, promotional flags and a support-article URL, none of which
+ * the bar reads. The important one is TRUST -- every value here reaches a
+ * terminal on the next render, so the model name is stripped to a safe charset
+ * and clipped, severity is whitelisted rather than passed through, and percent
+ * is clamped. Nothing from the network is written to the cache unfiltered.
+ *
+ * @returns a snapshot, or null when the body carries no usable limit at all
+ */
+function normalizeUsage(body) {
+  const limits = [];
+  for (const e of Array.isArray(body?.limits) ? body.limits : []) {
+    if (!e || typeof e !== 'object') continue;
+    const pct = num(e.percent);
+    if (pct === null) continue;
+
+    const kind = typeof e.kind === 'string' ? e.kind.replace(/[^a-z_]/gi, '').slice(0, 32) : '';
+    if (!kind) continue;
+
+    const sev = typeof e.severity === 'string' ? e.severity.toLowerCase().replace(/[^a-z]/g, '') : '';
+    // `resets_at` is an ISO 8601 string here, unlike the payload's epoch
+    // seconds. Stored as seconds so it matches everything else in this file.
+    const resets = typeof e.resets_at === 'string' ? Date.parse(e.resets_at) : NaN;
+    const model = modelLabel(e?.scope?.model?.display_name);
+
+    limits.push({
+      kind,
+      percent: clamp(pct, 0, 100),
+      severity: USAGE_SEVERITIES.has(sev) ? sev : 'normal',
+      model: model || null,
+      resets: Number.isFinite(resets) ? Math.floor(resets / 1000) : null,
+    });
+
+    if (limits.length >= 16) break;   // a response with more than this is not ours
+  }
+
+  return limits.length ? { v: 1, at: Date.now(), limits } : null;
+}
+
+/** Detached-child entry point. Writes the cache, prints nothing, exits. */
+async function usageRefresh() {
+  if (!usageEnabled()) return;
+
+  const token = readOauthToken();
+  if (!token) return;
+
+  const snap = normalizeUsage(await fetchUsage(token));
+  if (!snap) return;   // a failed refresh leaves the previous snapshot in place
+
+  const file = usageCachePath();
+  const tmp = `${file}.${process.pid}.tmp`;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(tmp, JSON.stringify(snap), 'utf8');
+    fs.renameSync(tmp, file);   // atomic: a render can never read a half-written cache
+  } catch {
+    try { fs.unlinkSync(tmp); } catch { /* nothing else to do */ }
+  }
 }
 
 /* ---------------------------------------------------------------------------
@@ -1675,11 +2232,8 @@ function tokenRateCell(sessionCost, tokens) {
 }
 
 /**
- * Fable's share of the weekly allowance, spent: "Fable 42%".
- *
- * Shown only while Fable is the active model -- it is a pacing gauge for the
- * decision you are making right now, not a historical statistic, and on any
- * other model it would just be a column of noise.
+ * The local estimate of Fable's share of its weekly allowance, as a raw
+ * percentage. Null when the ingredients are not all present.
  *
  * Dollars are the only currency the local ledger and the host's seven-day
  * window have in common, so Fable's slice of the window's SPEND is taken as its
@@ -1688,35 +2242,99 @@ function tokenRateCell(sessionCost, tokens) {
  * ledger (installed mid-week, work done on another machine) moves them together
  * and mostly cancels out of the ratio.
  *
- * This is an estimate, and the assumption inside it is that a dollar of Fable
- * and a dollar of Sonnet consume the same fraction of the weekly limit. They do
- * not, exactly. It is the closest thing available without leaving the payload.
+ * The assumption inside it is that a dollar of Fable and a dollar of Sonnet
+ * consume the same fraction of the weekly limit. They do not, exactly, and that
+ * residual error is what the calibration constant measures and removes -- see
+ * the calibration block in updateLedger(). This function stays deliberately
+ * UNcorrected so it can serve as the thing being measured.
  *
- * No seven-day window (billed plans) -> empty, and the cell collapses.
+ * The weekly percentage comes from the payload when there is one and from the
+ * usage snapshot otherwise, which is what lets the cell survive the opening
+ * stretch of a session: `rate_limits` is absent until the first API response
+ * lands, and the snapshot is not.
  */
-function fableCell(d, t) {
-  if (!isFableModel(d)) return '';
-
+function rawFablePct(d, t) {
   const spent = num(t?.fable);
-  const weekPct = num(d?.rate_limits?.seven_day?.used_percentage);
   const windowSpend = num(t?.fableWindow);
-  if (spent === null || spent < 0) return '';
-  if (weekPct === null || windowSpend === null || windowSpend <= 0) return '';
+  const weekPct = num(d?.rate_limits?.seven_day?.used_percentage) ?? num(t?.weekly?.percent);
+  if (spent === null || spent < 0) return null;
+  if (weekPct === null || windowSpend === null || windowSpend <= 0) return null;
 
   // Guard the share against a ledger that somehow recorded more Fable spend
   // than total spend -- a partially pruned store can do it, and it must not
   // project past the whole window.
   const share = Math.min(1, spent / windowSpend);
 
+  const pct = ((weekPct * share) / FABLE_WEEKLY_SHARE) * 100;
+  return Number.isFinite(pct) ? Math.max(0, pct) : null;
+}
+
+/**
+ * Colour for a server-reported figure.
+ *
+ * `severity` is the server's own read on the same number and it knows things
+ * the percentage does not -- a soft cap being approached, a bucket already
+ * refused -- so it can only ever make the cell MORE alarming, never less. A
+ * "normal" severity at 95% still renders red.
+ */
+function severityColor(severity, pct) {
+  if (severity === 'critical' || severity === 'exceeded') return red;
+  const base = pctColor(pct);
+  if (severity === 'warning' && base === green) return yellow;
+  return base;
+}
+
+/**
+ * The model-scoped weekly allowance, spent: "Fable 42%", or "Fable ~42%" when
+ * the number is the local estimate rather than the server's own.
+ *
+ * Two sources, in order:
+ *
+ *   1. The `weekly_scoped` bucket from the usage endpoint. This is a
+ *      measurement -- the server's percentage of that model's own allowance --
+ *      so when it is present and fresh it simply wins, and it is drawn without
+ *      the tilde. It is also not Fable-specific: whatever model the account has
+ *      a scoped bucket for is what gets reported, under the server's own name
+ *      for it.
+ *
+ *   2. Failing that, the local dollar-ratio estimate, corrected by whatever
+ *      calibration the endpoint has taught it so far. Shown only while Fable is
+ *      the active model -- it is a pacing gauge for the decision being made
+ *      right now, not a historical statistic, and on any other model it would
+ *      be a column of noise. The leading "~" is the whole point of the
+ *      distinction: an estimate that looks identical to a measurement is how
+ *      you end up trusting it at exactly the wrong moment.
+ *
+ * No seven-day window and no snapshot (billed plans) -> empty, and the cell
+ * collapses.
+ */
+function fableCell(d, t) {
+  const scoped = t?.scoped;
+  const truth = num(scoped?.percent);
+  if (truth !== null) {
+    const pct = clamp(truth, 0, 100);
+    // The server's own name for the scope, so a rename upstream shows up as a
+    // relabelled cell rather than as a wrong one. Re-sanitised here and not
+    // merely where it was cached: this is the last point before it reaches a
+    // terminal, and it arrived from a file.
+    const label = modelLabel(scoped.model) || 'Scoped';
+    return `${dim(label)} ${severityColor(scoped.severity, pct)(`${Math.round(pct)}%`)}`;
+  }
+
+  if (!isFableModel(d)) return '';
+
+  const raw = rawFablePct(d, t);
+  if (raw === null) return '';
+
   // Clamped at 100 because this estimates a percentage of a limit that cannot
   // be exceeded: the API stops you there. A reading past it is estimator error,
-  // not headroom that was actually spent, and "Fable 180%" would present the
+  // not headroom that was actually spent, and "Fable ~180%" would present the
   // error as the measurement. Upstream clamps its authoritative figure the same
   // way.
-  const pct = Math.min(100, ((weekPct * share) / FABLE_WEEKLY_SHARE) * 100);
+  const pct = Math.min(100, raw * (num(t?.calib) ?? 1));
   if (!Number.isFinite(pct)) return '';
 
-  return `${dim('Fable')} ${pctColor(Math.max(0, pct))(`${Math.round(Math.max(0, pct))}%`)}`;
+  return `${dim('Fable')} ${pctColor(pct)(`~${Math.round(pct)}%`)}`;
 }
 
 function lineUsage(d, ledger, nowSeconds, maxWidth) {
@@ -1914,26 +2532,8 @@ const UPDATE_MAX_BYTES = 5 * 1024 * 1024;
  */
 function maybeSelfUpdate() {
   try {
-    const dir = claudeDir();
-
-    const flag = fs.statSync(path.join(dir, UPDATE_FLAG_FILE), { throwIfNoEntry: false });
-    if (!flag) return;
-
-    const marker = path.join(dir, UPDATE_MARKER_FILE);
-    const stamp = fs.statSync(marker, { throwIfNoEntry: false });
-    if (stamp && Date.now() - stamp.mtimeMs < UPDATE_INTERVAL_MS) return;
-
-    // Touch the marker BEFORE spawning, not after. Two renders can overlap
-    // inside the 300ms debounce, and a network failure must not re-arm the
-    // check on every single render for the rest of the day.
-    fs.writeFileSync(marker, new Date().toISOString() + '\n');
-
-    const child = require('child_process').spawn(
-      process.execPath,
-      [__filename, '--self-update'],
-      { detached: true, stdio: 'ignore', windowsHide: true }
-    );
-    child.unref();
+    if (!fs.statSync(path.join(claudeDir(), UPDATE_FLAG_FILE), { throwIfNoEntry: false })) return;
+    spawnDebounced(UPDATE_MARKER_FILE, UPDATE_INTERVAL_MS, '--self-update');
   } catch {
     // An updater that can blank the status bar is worse than a stale statusline.
   }
@@ -2075,12 +2675,7 @@ function main() {
   // It carries both the cost roll-ups and the accumulated token totals.
   const ledger = safe(
     () => updateLedger(data),
-    {
-      session: 0, day: 0, week: 0, month: 0,
-      tokens: null, period: null, periodEnd: null,
-      fable: 0, fableWindow: 0,
-      context: { input: null, pct: null, compacted: false },
-    }
+    emptyTotals(0, { input: null, pct: null, compacted: false })
   );
 
   lines.push(safe(() => lineModel(data, width), 'Claude'));
@@ -2107,12 +2702,17 @@ function main() {
 
   // Strictly after the write, so nothing here can delay a single frame.
   maybeSelfUpdate();
+  maybeRefreshUsage(data, ledger);
 }
 
 if (process.argv.includes('--self-update')) {
   // Detached child spawned by maybeSelfUpdate(). Never reads stdin, never
   // prints, and its exit code is discarded.
   selfUpdate().catch(() => {});
+} else if (process.argv.includes('--usage-refresh')) {
+  // Detached child spawned by maybeRefreshUsage(). Same contract: no stdin, no
+  // stdout, exit code discarded.
+  usageRefresh().catch(() => {});
 } else {
   try {
     main();

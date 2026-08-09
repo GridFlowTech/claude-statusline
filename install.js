@@ -27,6 +27,7 @@
  *   <config>/.statusline-manifest.json  sha256 of what we installed, so the
  *                                       auto-updater can detect local edits
  *   <config>/.statusline-autoupdate     flag file, only with --auto-update
+ *   <config>/.statusline-usage          flag file, only with --usage
  *
  *   <config> is $CLAUDE_CONFIG_DIR, else ~/.claude. Never anything outside it.
  *   The cost ledger is user data and is never written or deleted by default.
@@ -55,6 +56,15 @@ const SUB = 'subagent-statusline.js';
 const MANIFEST = '.statusline-manifest.json';
 const AUTOUPDATE_FLAG = '.statusline-autoupdate';
 const UPDATE_MARKER = '.statusline-last-update';
+
+// Opt-in for the OAuth usage endpoint: with this flag present the status line
+// refreshes the server's own per-model weekly figure in a detached child every
+// ~90s. Off by default, on the same terms as auto-update -- it is the only
+// thing here that reaches the network with the user's credential, and that
+// should never start without being asked for.
+const USAGE_FLAG = '.statusline-usage';
+const USAGE_CACHE = '.statusline-usage.json';
+const USAGE_MARKER = '.statusline-usage-check';
 
 // Minimum plausible size for either script. A 404 body, a Cloudflare interstitial
 // or a truncated transfer all land far under this.
@@ -88,6 +98,7 @@ function parseArgs(argv) {
     source: 'auto',      // auto | local | remote
     scope: 'both',       // both | main | subagent
     autoUpdate: false,
+    usage: false,
     dryRun: false,
     uninstall: false,
     purge: false,
@@ -118,6 +129,8 @@ function parseArgs(argv) {
       case '--subagent-only': opts.scope = 'subagent'; break;
       case '--auto-update': opts.autoUpdate = true; break;
       case '--no-auto-update': opts.autoUpdate = false; break;
+      case '--usage': opts.usage = true; break;
+      case '--no-usage': opts.usage = false; break;
       case '--dry-run': opts.dryRun = true; break;
       case '--uninstall': opts.uninstall = true; break;
       case '--purge': opts.purge = true; break;
@@ -140,6 +153,12 @@ Options
   --dry-run           print every action, change nothing
   --auto-update       check GitHub for a newer statusline once a day (off by default)
   --no-auto-update    turn a previously enabled auto-update back off
+  --usage             read the server's own per-model weekly limit from the
+                      Claude OAuth usage endpoint (off by default). Costs no
+                      tokens; refreshes in the background about once a minute.
+                      On macOS the first refresh raises one Keychain prompt --
+                      answer "Always Allow" and it never returns.
+  --no-usage          turn the usage endpoint back off and delete its cache
   --main-only         install the status line, not the subagent panel
   --subagent-only     install the subagent panel, not the status line
   --interval <sec>    statusLine refreshInterval (default 30)
@@ -373,7 +392,8 @@ async function install(opts) {
   say(`  config dir  ${posix(dir)}`);
   say(`  source      ${src.mode === 'local' ? posix(src.dir) : `${REPO}@${opts.ref}`}`);
   say(`  installing  ${files.join(', ')}`);
-  say(`  auto-update ${opts.autoUpdate ? 'on (daily)' : 'off'}\n`);
+  say(`  auto-update ${opts.autoUpdate ? 'on (daily)' : 'off'}`);
+  say(`  usage api   ${opts.usage ? 'on (background, ~90s)' : 'off'}\n`);
 
   // Parse settings.json BEFORE anything is fetched or written. If it is not
   // valid JSON this run is going to abort, and it should abort having left the
@@ -446,6 +466,26 @@ async function install(opts) {
     say(`${tag}disabled auto-update`);
   }
 
+  // Usage-endpoint flag. Turning it off also drops the cached snapshot: a stale
+  // figure left on disk would be read by nothing, and leaving account data
+  // behind after the user opted out is the wrong default.
+  const usageFlag = path.join(dir, USAGE_FLAG);
+  if (opts.usage) {
+    if (!opts.dryRun) writeAtomic(usageFlag, `${manifest.installedAt}\n`);
+    say(`${tag}enabled  usage endpoint (${USAGE_FLAG})`);
+    if (process.platform === 'darwin') {
+      say('         macOS: the first refresh raises one Keychain prompt for');
+      say('         "Claude Code-credentials" -- answer "Always Allow".');
+    }
+  } else if (fs.existsSync(usageFlag)) {
+    if (!opts.dryRun) {
+      for (const name of [USAGE_FLAG, USAGE_CACHE, USAGE_MARKER]) {
+        try { fs.unlinkSync(path.join(dir, name)); } catch { /* best effort */ }
+      }
+    }
+    say(`${tag}disabled usage endpoint`);
+  }
+
   say(
     opts.dryRun
       ? '\nDry run. Nothing changed. Drop --dry-run to apply.\n'
@@ -479,7 +519,9 @@ function uninstall(opts) {
   }
 
   // Markers only go when the whole thing goes.
-  const extras = opts.scope === 'both' ? [MANIFEST, AUTOUPDATE_FLAG, UPDATE_MARKER] : [];
+  const extras = opts.scope === 'both'
+    ? [MANIFEST, AUTOUPDATE_FLAG, UPDATE_MARKER, USAGE_FLAG, USAGE_CACHE, USAGE_MARKER]
+    : [];
   // cost_ledger.json is your cost history, not our file. --purge only.
   const ledger = opts.purge ? ['cost_ledger.json'] : [];
 

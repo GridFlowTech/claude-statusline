@@ -121,6 +121,12 @@ gets a fix. And the runtime is free: Node is already a hard requirement.
 --dry-run           print every action, change nothing
 --auto-update       check GitHub for a newer statusline once a day (off by default)
 --no-auto-update    turn a previously enabled auto-update back off
+--usage             read the server's own per-model weekly limit from the
+                    Claude OAuth usage endpoint (off by default). Costs no
+                    tokens; refreshes in the background about once a minute.
+                    On macOS the first refresh raises one Keychain prompt --
+                    answer "Always Allow" and it never returns.
+--no-usage          turn the usage endpoint back off and delete its cache
 --main-only         install the status line, not the subagent panel
 --subagent-only     install the subagent panel, not the status line
 --interval <sec>    statusLine refreshInterval (default 30)
@@ -152,6 +158,7 @@ either without the other. See
 | `<config>/settings.json.bak`         | copy of your settings taken before the write                        |
 | `<config>/.statusline-manifest.json` | sha256 of what was installed, for the update edit-check             |
 | `<config>/.statusline-autoupdate`    | flag file, only with `--auto-update`                                |
+| `<config>/.statusline-usage`         | flag file, only with `--usage`                                      |
 
 `<config>` is `$CLAUDE_CONFIG_DIR` if set, else `~/.claude`. Nothing outside it
 is ever touched, and `cost_ledger.json` is never written or deleted by the
@@ -222,8 +229,10 @@ curl -fsSL https://raw.githubusercontent.com/GridFlowTech/claude-statusline/main
 irm https://raw.githubusercontent.com/GridFlowTech/claude-statusline/main/install.js | node - --uninstall
 ```
 
-It removes both settings keys, both scripts and the two marker files, backing
-`settings.json` up first and leaving every other key alone.
+It removes both settings keys, both scripts, and the manifest, flag and marker
+files for [auto-update](#auto-update) and the [usage endpoint](#usage-endpoint) -
+including the cached usage snapshot - backing `settings.json` up first and
+leaving every other key alone.
 
 **`cost_ledger.json` is kept.** It is your cost history, not part of the
 install, and a reinstall picks up exactly where you left off. Add `--purge` to
@@ -345,7 +354,8 @@ Ctx 15% · In 152,002 Out 153,470 · Cache 98% · LngCtx 76% · 5h 90%:20%↑ 02
 | `7d`        | `rate_limits.seven_day`             | Subscription plans only.                                               |
 | `Bgt`       | ledger + `CC_STATUSLINE_BUDGET`     | Billed plans only, and only with a budget set. See below.              |
 | `$/Mtok`    | `cost` + **transcript**             | Billed plans only, and only with a readable transcript.                |
-| `Fable n%`  | ledger + `rate_limits.seven_day`    | Estimated share of the Fable allowance spent. Trails the line, and only while Fable is the active model. See below. |
+| `Fable n%`  | [usage endpoint](#usage-endpoint)   | Share of the Fable allowance spent, straight from the server. Trails the line. See below. |
+| `Fable ~n%` | ledger + `rate_limits.seven_day`    | The same figure *estimated* locally, when the server's is unavailable. The tilde is the difference. Only while Fable is the active model. |
 
 Context and rate limits share one line because they answer the same question -
 how much runway is left - and because merging them lets the width budget be
@@ -834,24 +844,34 @@ crossing is a billing event, not a gauge reading.
 
 As of July 2026 a subscription may spend up to half its weekly limit on Fable 5.
 That makes the `7d` cell alone useless for pacing Fable: a 40% weekly reading is
-comfortable if it is all Sonnet and nearly spent if it is all Fable. So the
-ledger keeps Fable spend in its own seven-day bucket, and while Fable is the
-active model the bar reports that bucket against the Fable allowance rather than
-against the whole limit.
+comfortable if it is all Sonnet and nearly spent if it is all Fable. So the cell
+reports Fable's own bucket against the Fable allowance rather than against the
+whole limit.
+
+There are two ways to get that number, and the tilde tells you which one you are
+looking at:
+
+| Cell | Source |
+|------|--------|
+| `Fable 2%` | the server's own figure, from the [usage endpoint](#usage-endpoint) |
+| `Fable ~2%` | the local estimate below |
+
+Colours match `Ctx` - green < 70, yellow ≥ 70, red ≥ 90. A server figure carrying
+a `warning` or `critical` severity is escalated beyond what its percentage alone
+would earn; severity can only ever make the cell *more* alarming, never less.
+
+#### The estimate
+
+Without the usage endpoint the payload carries no model-scoped weekly bucket -
+`rate_limits` is exactly `five_hour` and `seven_day` - so the only way to split
+the weekly figure by model is to weight it by the model's share of local ledger
+spend over the same window:
 
 ```text
 share  = min(1, ledger.fable / ledger.fableWindow)
-Fable% = min(100, seven_day.used_percentage × share / CC_STATUSLINE_FABLE_SHARE × 100)
+raw%   = seven_day.used_percentage × share / CC_STATUSLINE_FABLE_SHARE × 100
+Fable% = min(100, raw% × k)
 ```
-
-Colours match `Ctx` - green < 70, yellow ≥ 70, red ≥ 90.
-
-**This is an estimate, not a measurement.** The payload carries no model-scoped
-weekly bucket - `rate_limits` is exactly `five_hour` and `seven_day` - so the
-only way to split the weekly figure by model is to weight it by the model's
-share of local ledger spend over the same window. Upstream ccstatusline reads an
-authoritative per-model figure from the server instead; that needs OAuth and a
-network round trip, and nothing here does either on the render path.
 
 The window is anchored on `seven_day.resets_at` minus seven days, not on a local
 calendar boundary, so the bucket and the limit it is measured against cover the
@@ -861,16 +881,175 @@ reassigning the whole session to whichever model happened to be active at the
 last render.
 
 `CC_STATUSLINE_FABLE_SHARE` sets the allowance percentage. It is the one number
-in the formula that is a policy assumption rather than a payload field, which is
-why it is the only knob - the default tracks the July 2026 policy and the env var
+in `raw%` that is a policy assumption rather than a payload field, which is why
+it is the only knob - the default tracks the July 2026 policy and the env var
 covers it moving.
 
-**The cell reads low on first install.** The Fable bucket is a new ledger field,
-so sessions recorded before it existed carry no attribution and the estimate
-starts near zero. It becomes accurate once the rolling seven-day window has
-turned over. It collapses entirely on a billed plan, which is correct: there is
-no Fable allowance to pace against there, only dollars, and `Bgt` already covers
-those.
+#### `k` - the learned correction
+
+`raw%` assumes a dollar of Fable and a dollar of Sonnet consume the same fraction
+of the weekly limit. They do not, exactly, and the size of the error depends on
+things no formula here can see: whether the server normalises its scoped bucket
+against the Fable allowance or against the whole weekly limit, and what model mix
+and reasoning effort your account actually runs at.
+
+So it is measured rather than assumed. Every render that has **both** the server
+figure and the local estimate records the ratio between them:
+
+```text
+k ← 0.75 × k + 0.25 × (server% / raw%)      clamped to [0.2, 5]
+```
+
+`k` lives in the ledger as `fcal` and is applied whenever the server figure is
+missing - offline, token expired, or the endpoint switched off. Samples below 2%
+on either side are discarded: their quotient is dominated by rounding. One render
+with the endpoint on is enough to seed it; it converges within an hour of use and
+re-converges on its own if your habits change.
+
+Turn the endpoint off and `k` simply stops updating - the last value learned goes
+on correcting the estimate.
+
+**The cell reads low on first install.** The Fable bucket is a ledger field
+sessions predating it carry no attribution for, so the estimate starts near zero
+and becomes accurate once the rolling seven-day window has turned over. The
+server figure has no such warm-up. Both collapse entirely on a billed plan, which
+is correct: there is no Fable allowance to pace against there, only dollars, and
+`Bgt` already covers those.
+
+## Usage endpoint
+
+**Off by default.** Turn it on with `install.js --usage`, off again with
+`--no-usage`.
+
+`GET https://api.anthropic.com/api/oauth/usage`, authenticated with the same
+OAuth bearer Claude Code already holds, answers the question the statusline
+payload cannot:
+
+```json
+{ "limits": [
+    { "kind": "session",       "percent": 18, "severity": "normal" },
+    { "kind": "weekly_all",    "percent":  8, "severity": "normal" },
+    { "kind": "weekly_scoped", "percent":  2, "severity": "normal",
+      "scope": { "model": { "display_name": "Fable" } } } ] }
+```
+
+`weekly_scoped` is the per-model weekly bucket, computed server-side and already
+expressed as a percentage of that model's own allowance. It is a measurement
+where the `Fable` estimate is an inference, so when it is available it wins - and
+it is matched to whatever model you are on by family name, so an account with a
+scoped bucket for something other than Fable gets that reported too, under the
+server's own label for it.
+
+**It costs no tokens.** There is no inference behind it; it is account metadata,
+the same figures `/usage` shows.
+
+### Which plans
+
+| Plan | |
+|------|--|
+| Pro / Max | Works. This is what it was built against. |
+| Team / Enterprise seat | Should work - same OAuth credential, and the response already carries `member_dashboard_available`, an org-seat concept. **Unverified**: developed on a `max` account. An org with no per-model limits gets `session` and `weekly_all` only, no `weekly_scoped`, so the cell collapses and the [gate](#when-it-actually-refreshes) drops to hourly retries. Degrades, does not break. |
+| API key, Bedrock, Vertex | Inert **by design**. There is no `claudeAiOauth` credential on those deployments, so the child exits without making a request and no cache is ever written. The bar falls back to the `Bgt` budget cell exactly as before. |
+
+Managed environments get the right defaults without any of this: the feature is
+off unless a flag file exists, and `CC_STATUSLINE_USAGE=0` forces it off
+fleet-wide through environment policy without touching files.
+
+### How it stays off the render path
+
+The render loop runs on a 300 ms debounce and a TLS round trip inside it would
+make the bar stutter. So the work splits exactly the way [auto-update](#auto-update)
+does:
+
+| | |
+|---|---|
+| **render** | one `statSync` on the flag, one on a debounce marker, one small `readFileSync`. When the marker ages past the TTL it is touched and a **detached** child is spawned. This render draws whatever was already cached and never waits. |
+| **child** | reads the credential, makes the request, writes the cache, exits. Nothing it does can delay a frame. |
+
+The marker is stamped *before* the spawn, so a request that fails - offline, 401,
+rate limited - still debounces for a full TTL instead of re-arming on every
+render. A failed refresh leaves the previous snapshot in place.
+
+There is no daemon. Refreshes ride the render loop, so a machine with Claude
+Code closed makes no requests at all.
+
+### When it actually refreshes
+
+The endpoint answers for the whole account, but only a model with a scoped
+bucket has anything to draw from it. Polling every 90s while on a model that has
+none would be traffic bought for nothing, so the full cadence is gated:
+
+| Condition | Cadence |
+|-----------|---------|
+| Nothing cached yet | one bootstrap request, whatever the model |
+| Snapshot older than an hour | one request, whatever the model |
+| This model has a scoped bucket, or is Fable | every TTL (90s) |
+| Otherwise | none |
+
+The two model-blind escapes are not optional. A model earns a scoped bucket by
+appearing in a response, so a gate that only refreshed for models already known
+to have one could never discover the first - the hourly retry is what picks up a
+bucket Anthropic adds later, at roughly 1/40th the traffic of the full cadence.
+
+Fable stays on the full cadence even with no bucket cached, because its
+[fallback estimate](#k---the-learned-correction) is calibrated from exactly these
+responses.
+
+Past **one hour** without a successful refresh the cached figure stops counting
+as a measurement and the calibrated estimate takes over. An hour of drift on a
+seven-day window is negligible; an hour of silence means something is actually
+broken, and presenting a stale measurement as current is the one failure worse
+than presenting an estimate.
+
+### Credentials
+
+| Platform | Store |
+|----------|-------|
+| Windows, Linux, WSL | `<config>/.credentials.json` |
+| macOS | login Keychain, service `Claude Code-credentials` |
+
+On macOS the child shells out to `security find-generic-password -w`. **The first
+refresh raises one Keychain prompt** naming `/usr/bin/security` - answer *Always
+Allow* and it never returns. That prompt is precisely why the read happens in the
+detached child: a blocking dialog on the render path would freeze the status bar.
+
+The Keychain is consulted only when `CLAUDE_CONFIG_DIR` is unset. A caller that
+pointed the statusline at a specific config directory means the credentials in
+*that* directory, and honouring it is what keeps a sandboxed config - the test
+suite included - from ever reaching the real account.
+
+The token is read, used once, and never stored, logged, or written to the cache.
+
+### Hardening
+
+- **No redirects are followed.** The request carries a bearer token; following a
+  302 would hand that credential to whatever host the redirect names. The
+  self-updater does follow redirects, because it sends no credential at all -
+  the two deliberately do not share a fetch helper.
+- The response is capped at 256 KB (the real one is ~1.5 KB) and timed out at 10 s.
+- Only the fields the bar draws are cached. Percentages are clamped, severities
+  whitelisted, model names stripped to `[\w .+-]` and clipped to 24 chars.
+- The cache is re-validated and re-sanitised **on read**, not merely on write. It
+  is a file in a shared config directory, and anything that can write it would
+  otherwise get a string into your terminal on the next render. Symlinks and
+  files over 64 KB are refused outright.
+- Written by atomic rename, so a render can never read a half-written cache.
+
+### Files and settings
+
+| Path | |
+|------|--|
+| `<config>/.statusline-usage` | flag file; the feature is off without it |
+| `<config>/.statusline-usage.json` | the cached snapshot, ~300 bytes |
+| `<config>/.statusline-usage-check` | refresh debounce marker |
+
+| Variable | Default | |
+|----------|---------|--|
+| `CC_STATUSLINE_USAGE=0` | - | Kill switch. Forces the feature off even with the flag present. It cannot turn it *on* - opting in is a deliberate on-disk act, so a stray inherited variable can never start network traffic. |
+| `CC_STATUSLINE_USAGE_TTL` | `90` | Seconds between refreshes, clamped to `[60, 600]`. The bucket it feeds moves by single-digit percent per *day*, so anything under a minute is waste. |
+
+`--no-usage` deletes the cache along with the flag: leaving account data behind
+after you opted out is the wrong default.
 
 ### Burn rate
 
@@ -937,7 +1116,8 @@ therefore require local state.
       "tCc": 403986,
       "tCr": 18754674
     }
-  }
+  },
+  "fcal": { "k": 0.5, "at": 1784968839965 }
 }
 ```
 
@@ -954,6 +1134,9 @@ therefore require local state.
 | `tOff`                   | Byte offset consumed so far - the incremental read resumes here.                           |
 | `tId`                    | Last counted message id, so streamed duplicates are not recounted across a chunk boundary. |
 | `tOut` `tIn` `tCc` `tCr` | Cumulative output / fresh input / cache-creation / cache-read tokens.                      |
+
+`fcal` sits beside `sessions` rather than inside it: it is an account-wide
+correction, not a per-session fact. See [`k`](#k---the-learned-correction).
 
 The token fields share this record rather than living in their own store: a
 separate file would mean two file round-trips per render for the same session.
@@ -1082,7 +1265,9 @@ In `subagent-statusline.js`:
 | `CC_STATUSLINE_BUDGET_PERIOD` | `day`, `week` or `month` (default).                                              |
 | `CC_STATUSLINE_BUDGET_RESET`  | `HH:MM` the budget period rolls over. `17:00` matches Console billing.           |
 | `CC_STATUSLINE_BUDGET_OFFSET` | Period spend the local ledger never saw.                                         |
-| `CC_STATUSLINE_FABLE_SHARE`   | Percent of the weekly limit Fable may use. Default `50`. Drives the `Fable` cell. |
+| `CC_STATUSLINE_FABLE_SHARE`   | Percent of the weekly limit Fable may use. Default `50`. Drives the `Fable` estimate. |
+| `CC_STATUSLINE_USAGE=0`       | Force the [usage endpoint](#usage-endpoint) off. Cannot turn it on - that needs `install.js --usage`. |
+| `CC_STATUSLINE_USAGE_TTL`     | Seconds between usage refreshes. Default `90`, clamped to `[60, 600]`.               |
 
 ---
 
@@ -1213,6 +1398,32 @@ by copy/paste, by editors, and by `core.autocrlf`.
 ---
 
 ## Troubleshooting
+
+**`Fable ~n%` never loses its tilde.**
+The tilde means the estimate is running because no server figure is available.
+In order: is the flag there (`ls <config>/.statusline-usage`)? Is
+`CC_STATUSLINE_USAGE=0` set anywhere? Then run the refresh child in the
+foreground and look at what it leaves behind:
+
+```bash
+node ~/.claude/statusline.js --usage-refresh
+cat ~/.claude/.statusline-usage.json
+```
+
+No file means the request failed. The usual causes are an expired token - open
+Claude Code once to refresh it - or, on macOS, a declined Keychain prompt. Check
+the credential is reachable by hand:
+
+```bash
+curl -s -H "Authorization: Bearer $(security find-generic-password -s 'Claude Code-credentials' -w | \
+  node -pe 'JSON.parse(require("fs").readFileSync(0)).claudeAiOauth.accessToken')" \
+     -H "anthropic-beta: oauth-2025-04-20" \
+     https://api.anthropic.com/api/oauth/usage
+```
+
+A snapshot that exists but is over an hour old is treated as stale by design and
+the estimate takes over; delete `.statusline-usage-check` to force a retry now
+rather than waiting out the TTL.
 
 **The bar is blank.**
 Run the script by hand with a mock payload:
