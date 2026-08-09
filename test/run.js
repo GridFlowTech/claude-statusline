@@ -1504,7 +1504,7 @@ console.log('\nself-update\n');
  * missing or the installed bytes no longer match it -- which keeps the suite
  * offline while still exercising the guards that matter.
  */
-function selfUpdate(dir) {
+function runUpdateChild(dir) {
   const res = spawnSync(process.execPath, [path.join(dir, 'statusline.js'), '--self-update'], {
     encoding: 'utf8',
     input: '',
@@ -1521,7 +1521,7 @@ check('a locally edited statusline is never overwritten', () => {
   fs.appendFileSync(file, '\n// a tunable, edited by hand\n');
   const before = fs.readFileSync(file, 'utf8');
 
-  const r = selfUpdate(dir);
+  const r = runUpdateChild(dir);
   assert(r.status === 0, `exit ${r.status}`);
   assert(fs.readFileSync(file, 'utf8') === before, 'an edited file was reverted');
 });
@@ -1533,7 +1533,7 @@ check('no manifest means no update attempt, and no output', () => {
   const file = path.join(dir, 'statusline.js');
   const before = fs.readFileSync(file, 'utf8');
 
-  const r = selfUpdate(dir);
+  const r = runUpdateChild(dir);
   assert(r.status === 0, `exit ${r.status}`);
   assert(r.stdout === '', `expected silence, got ${JSON.stringify(r.stdout)}`);
   assert(fs.readFileSync(file, 'utf8') === before, 'the script changed without a manifest');

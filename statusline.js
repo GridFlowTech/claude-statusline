@@ -1926,8 +1926,16 @@ function normalizeUsage(body) {
   return limits.length ? { v: 1, at: Date.now(), limits } : null;
 }
 
-/** Detached-child entry point. Writes the cache, prints nothing, exits. */
-async function usageRefresh() {
+/**
+ * Detached-child half: fetch the account's figures and write them to the cache.
+ *
+ * Named for what it does rather than for the feature it belongs to, so it
+ * cannot be mistaken at a glance for maybeRefreshUsage() -- the render-path
+ * trigger that spawns it. This is the end that makes the network request.
+ *
+ * Prints nothing, and its exit code is discarded.
+ */
+async function cacheUsageSnapshot() {
   if (!usageEnabled()) return;
 
   const token = readOauthToken();
@@ -2572,10 +2580,16 @@ function updateFetch(https, url, redirects) {
 }
 
 /**
- * Detached-child half. Nothing here is on the render path, so it may take as
- * long as it likes. Every failure mode is "leave the installed file alone".
+ * Detached-child half: fetch, verify, and rename the new files into place.
+ *
+ * Named for what it does rather than for the feature it belongs to, so it
+ * cannot be mistaken at a glance for maybeSelfUpdate() -- the four-line render-
+ * path trigger that spawns it. This is the end that overwrites files on disk.
+ *
+ * Nothing here is on the render path, so it may take as long as it likes. Every
+ * failure mode is "leave the installed file alone".
  */
-async function selfUpdate() {
+async function installUpdate() {
   const https = require('https');
   const crypto = require('crypto');
   const { spawnSync } = require('child_process');
@@ -2705,14 +2719,18 @@ function main() {
   maybeRefreshUsage(data, ledger);
 }
 
+// The flag strings are an INTERFACE, not an implementation detail: an already
+// installed copy spawns these exact arguments, so renaming one would break a
+// child spawned from a half-updated file. They stay put even when the functions
+// behind them are renamed.
 if (process.argv.includes('--self-update')) {
   // Detached child spawned by maybeSelfUpdate(). Never reads stdin, never
   // prints, and its exit code is discarded.
-  selfUpdate().catch(() => {});
+  installUpdate().catch(() => {});
 } else if (process.argv.includes('--usage-refresh')) {
   // Detached child spawned by maybeRefreshUsage(). Same contract: no stdin, no
   // stdout, exit code discarded.
-  usageRefresh().catch(() => {});
+  cacheUsageSnapshot().catch(() => {});
 } else {
   try {
     main();
