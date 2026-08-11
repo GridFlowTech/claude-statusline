@@ -60,11 +60,59 @@ const paint = (code, s) => (USE_COLOR && s !== '' ? `${E}${code}m${s}${E}0m` : s
 const dim = (s) => paint('2', s);
 const bold = (s) => paint('1', s);
 const red = (s) => paint('38;5;203', s);
-const yellow = (s) => paint('38;5;179', s);
-const green = (s) => paint('38;5;108', s);
 const cyan = (s) => paint('38;5;110', s);
+const green = (s) => paint('38;5;108', s);
 
 const SEP = dim(' · ');
+
+/* ---------------------------------------------------------------------------
+ * Context degradation scale
+ * ----------------------------------------------------------------------------
+ * A teammate's context is coloured by ABSOLUTE TOKENS, not by percentage of its
+ * window -- the same scale the main statusline paints its own `Ctx` cell on, so
+ * that a number on this panel means what the equivalent number means on the bar
+ * above it. Attention degrades on a token scale, and the window size is a
+ * licensing decision: 200k of context is exactly as reliable whether the model
+ * is willing to accept 200k of it or 1M. Colouring by percentage would say a
+ * teammate on a 200k window at 190k is critical while one on a 1M window at
+ * 190k is comfortable, when both hold the same 190k.
+ *
+ * That difference is sharper here than on the main bar, because a panel mixes
+ * models: a Haiku row and an Opus row sit one above the other, and percentages
+ * against different denominators cannot be compared down the column. Token
+ * tiers can.
+ *
+ * Five tiers, from the NoLiMa / MRCR v2 / RULER benchmark work on mid-2026
+ * 1M+ models:
+ *
+ *   0    - 32K    Optimal            maximum effective context window
+ *   32K  - 128K   Attention dilution measurable unreliability begins
+ *   128K - 250K   Moderate rot       multi-needle reasoning limit
+ *   250K - 600K   Severe             effective capacity ceiling, recall cliffs
+ *   600K - 1.05M  Critical collapse  structural logic and agentic failure
+ *
+ * Truecolor (38;2;R;G;B) rather than the 256-colour palette the rest of the row
+ * uses, because these five hexes are the scale -- an approximation to the
+ * nearest xterm index would put two adjacent tiers within a few units of each
+ * other and cost the reading at a glance that the whole thing is for.
+ * ------------------------------------------------------------------------ */
+
+const CTX_TIERS = [
+  [32000, '0;176;80'],      // #00B050  optimal
+  [128000, '255;215;0'],    // #FFD700  attention dilution
+  [250000, '255;140;0'],    // #FF8C00  moderate context rot
+  [600000, '255;69;0'],     // #FF4500  severe degradation
+];
+const CTX_CRITICAL = '255;0;0';   // #FF0000  critical collapse, 600K and up
+
+/** Painter for a context length, in tokens. */
+function ctxColor(tokens) {
+  const t = num(tokens) ?? 0;
+  for (const [limit, rgb] of CTX_TIERS) {
+    if (t < limit) return (s) => paint(`38;2;${rgb}`, s);
+  }
+  return (s) => paint(`38;2;${CTX_CRITICAL}`, s);
+}
 
 /* ---------------------------------------------------------------------------
  * Helpers (mirrors of the main statusline's, kept local so this file stands
@@ -242,16 +290,22 @@ function renderRow(task, columns, nowMs) {
   const modelCell = [model && cyan(model), effort && dim(effort)].filter(Boolean).join(' ');
 
   // tokenCount against contextWindowSize gives a per-row context percentage,
-  // computed the same way the main statusline computes its own.
+  // computed the same way the main statusline computes its own. The percentage
+  // is what says how much room is left; the COLOUR comes from the raw token
+  // count, on the degradation scale above -- see there for why the two are
+  // different numbers.
+  //
+  // The count is painted rather than the percentage, so a row still carries a
+  // tier when `contextWindowSize` is absent. That field only arrived in
+  // v2.1.205, and the tokens alone are enough to place a teammate on the scale.
   const tokens = num(task?.tokenCount);
   const windowSize = num(task?.contextWindowSize);
   let tokenCell = '';
   if (tokens !== null) {
-    tokenCell = dim(compactTokens(tokens));
+    tokenCell = ctxColor(tokens)(compactTokens(tokens));
     if (windowSize !== null && windowSize > 0) {
       const pct = (tokens / windowSize) * 100;
-      const colour = pct >= 90 ? red : pct >= 70 ? yellow : green;
-      tokenCell += ' ' + colour(`${Math.round(pct)}%`);
+      tokenCell += ' ' + dim(`${Math.round(pct)}%`);
     }
   }
 

@@ -426,6 +426,50 @@ function pctColor(p) {
   return green;
 }
 
+/* ---------------------------------------------------------------------------
+ * Context degradation scale
+ * ----------------------------------------------------------------------------
+ * The Ctx gauge is coloured by ABSOLUTE TOKENS, not by percentage of the
+ * window -- which is why it does not use pctColor() above. Attention degrades
+ * on a token scale, and the window size is a licensing decision: 200k of
+ * context is exactly as reliable whether the model is willing to accept 200k
+ * or 1M of it. Colouring by percentage says a 200k window at 190k is critical
+ * while a 1M window at 190k is comfortable, which inverts the truth -- both
+ * hold the same 190k, and the second one is merely allowed to keep going.
+ *
+ * Five tiers, from the NoLiMa / MRCR v2 / RULER benchmark work on mid-2026
+ * 1M+ models:
+ *
+ *   0    - 32K    Optimal            maximum effective context window
+ *   32K  - 128K   Attention dilution measurable unreliability begins
+ *   128K - 250K   Moderate rot       multi-needle reasoning limit
+ *   250K - 600K   Severe             effective capacity ceiling, recall cliffs
+ *   600K - 1.05M  Critical collapse  structural logic and agentic failure
+ *
+ * Truecolor (38;2;R;G;B) rather than the 256-colour palette the rest of the
+ * bar uses, because these five hexes are the scale -- an approximation to the
+ * nearest xterm index would put two adjacent tiers within a few units of each
+ * other and cost the reading at a glance that the whole thing is for.
+ * ------------------------------------------------------------------------ */
+
+const CTX_TIERS = [
+  [32000, '0;176;80'],      // #00B050  optimal
+  [128000, '255;215;0'],    // #FFD700  attention dilution
+  [250000, '255;140;0'],    // #FF8C00  moderate context rot
+  [600000, '255;69;0'],     // #FF4500  severe degradation
+];
+const CTX_CRITICAL = '255;0;0';   // #FF0000  critical collapse, 600K and up
+
+/** Painter for a context length, in tokens. Unknown lengths never reach here --
+ *  the caller draws the compaction marker instead. */
+function ctxColor(tokens) {
+  const t = num(tokens) ?? 0;
+  for (const [limit, rgb] of CTX_TIERS) {
+    if (t < limit) return (s) => paint(`38;2;${rgb}`, s);
+  }
+  return (s) => paint(`38;2;${CTX_CRITICAL}`, s);
+}
+
 /** Strip C0 AND C1 control bytes. Payload text lands in a terminal on every
  *  keystroke, and a stray ESC -- or an 8-bit CSI (U+009B), which some
  *  terminals honour just the same -- would let it inject escape sequences. */
@@ -2358,13 +2402,6 @@ function lineUsage(d, ledger, nowSeconds, maxWidth) {
   const ctxState = ledger?.context;
   const compacted = ctxState?.compacted === true;
 
-  const usedPct = num(ctxState?.pct);
-  const ctx = usedPct !== null
-    ? `${dim('Ctx')} ${pctColor(usedPct)(`${Math.round(usedPct)}%`)}`
-    : compacted
-      ? `${dim('Ctx')} ${cyan(GLYPH.compact)}`
-      : `${dim('Ctx')} ${pctColor(0)('0%')}`;
-
   // Token counts come from the COMBINED totals, not current_usage.
   //
   // current_usage.input_tokens is fresh, uncached input only -- on a warm
@@ -2383,6 +2420,17 @@ function lineUsage(d, ledger, nowSeconds, maxWidth) {
       : (num(usage?.input_tokens) ?? 0) +
         (num(usage?.cache_creation_input_tokens) ?? 0) +
         (num(usage?.cache_read_input_tokens) ?? 0));
+
+  // The percentage is what is drawn; the TOKEN COUNT is what picks the colour.
+  // See the degradation scale above for why the two come from different
+  // numbers. Inside a compaction gap neither is knowable, and the marker says
+  // so rather than guessing a tier.
+  const usedPct = num(ctxState?.pct);
+  const ctx = usedPct !== null
+    ? `${dim('Ctx')} ${ctxColor(inTok)(`${Math.round(usedPct)}%`)}`
+    : compacted
+      ? `${dim('Ctx')} ${cyan(GLYPH.compact)}`
+      : `${dim('Ctx')} ${ctxColor(0)('0%')}`;
 
   // Out is the session's CUMULATIVE output, accumulated from the transcript.
   // Neither payload field can supply this: total_output_tokens and

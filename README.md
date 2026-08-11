@@ -345,7 +345,7 @@ Ctx 15% · In 152,002 Out 153,470 · Cache 98% · LngCtx 76% · 5h 90%:20%↑ 02
 
 | Cell        | Source                              | Notes                                                                  |
 | ----------- | ----------------------------------- | ---------------------------------------------------------------------- |
-| `Ctx n%`    | `context_window.used_percentage`    | Green < 70, yellow ≥ 70, red ≥ 90. `0%` before the first response, `↺` in the gap after `/compact`. |
+| `Ctx n%`    | `context_window.used_percentage`    | Coloured by the token count behind the percentage, on a five-tier degradation scale - see [Ctx](#ctx). `0%` before the first response, `↺` in the gap after `/compact`. |
 | `In`        | `context_window.total_input_tokens` | Tokens currently in the window. `↺` while the post-`/compact` size is unknown. |
 | `Out`       | **transcript**                      | Session-cumulative output. Not available from the payload - see below. |
 | `Cache n%`  | **transcript**                      | Session-cumulative hit rate. Inverted colour scale - high is good.     |
@@ -797,6 +797,52 @@ Note the denominator differs from implementations using
 `read / (read + creation)`. That form omits fresh input and so overstates the
 hit rate.
 
+### Ctx
+
+The number drawn is `context_window.used_percentage` - what fraction of the
+window the host says is occupied. The **colour** comes from somewhere else: the
+absolute token count behind that percentage.
+
+| Tokens        | Colour                | Phase                                             |
+| ------------- | --------------------- | ------------------------------------------------- |
+| 0 - 32K       | `#00B050` green       | Optimal - maximum effective context window        |
+| 32K - 128K    | `#FFD700` gold        | Attention dilution - measurable unreliability begins |
+| 128K - 250K   | `#FF8C00` orange      | Moderate context rot - multi-needle reasoning limit |
+| 250K - 600K   | `#FF4500` orange-red  | Severe degradation - effective capacity ceiling, recall cliffs |
+| 600K - 1.05M  | `#FF0000` red         | Critical collapse - structural logic and agentic failure |
+
+Tiers are from the NoLiMa, MRCR v2 and RULER benchmark work on mid-2026 1M+
+models. Lower bound inclusive: 31,999 tokens is green, 32,000 is gold.
+
+**Why tokens and not the percentage.** Attention degrades on a token scale, and
+the window size is a licensing decision - 200k of context is exactly as reliable
+whether the model is willing to accept 200k of it or 1M. Colouring by percentage
+says a 200k window at 190k is critical while a 1M window at 190k is comfortable,
+which inverts the truth: both hold the same 190k, and the second is merely
+allowed to keep going. In practice this is what you notice on a 1M model, where
+`Ctx 46%` is 460k tokens and paints orange-red rather than reassuring green.
+
+The percentage is still the honest reading of *how much room is left*, which is
+why it is what gets printed. The two questions just have different answers, and
+the cell now carries both.
+
+Colour is emitted as truecolor (`38;2;R;G;B`) rather than from the 256-colour
+palette the rest of the bar uses, because these five hexes are the scale -
+approximating them to the nearest xterm index puts adjacent tiers within a few
+units of each other. `NO_COLOR` and `CC_STATUSLINE_NOCOLOR=1` suppress it like
+everything else.
+
+The [subagent panel](#subagent-status-lines-a-separate-feature) paints its
+per-row token counts on this same scale, so a number there means what the same
+number means on the bar above it. That matters more on the panel than here: it
+mixes models, so a Haiku row and an Opus row sit one above the other and their
+percentages run against different denominators. Token tiers compare down the
+column; percentages do not.
+
+Two readings are not tokens and are not tiered: `0%` before the first response
+of a session, and `↺` during the gap after `/compact` where the shrunk window
+size is not yet knowable. Neither guesses a tier.
+
 ### LngCtx
 
 ```text
@@ -811,9 +857,14 @@ gauge past 100% on any long session regardless of actual request size.
 
 `exceeds_200k_tokens` is a **fixed 200k threshold regardless of the actual
 window size**. On a 1M-context model it is therefore reached at roughly 20%
-context - long before `Ctx 20%` looks like anything worth noticing. Crossing it
-moves requests into the long-context premium tier and accelerates rate-limit
-burn.
+context. Crossing it moves requests into the long-context premium tier and
+accelerates rate-limit burn.
+
+This is a *pricing* boundary, which is what keeps it a separate cell from
+[Ctx](#ctx) even though both watch the same tokens. The Ctx scale says how well
+the model is still reasoning; `LngCtx` says what the next request costs. 200k
+happens to sit inside the moderate-rot tier, so the two are often alarming
+together - for unrelated reasons.
 
 Showing it as a percentage rather than a boolean flag means the _approach_ is
 visible, not just the arrival:
@@ -856,7 +907,9 @@ looking at:
 | `Fable 2%` | the server's own figure, from the [usage endpoint](#usage-endpoint) |
 | `Fable ~2%` | the local estimate below |
 
-Colours match `Ctx` - green < 70, yellow ≥ 70, red ≥ 90. A server figure carrying
+Coloured on the percentage itself - green < 70, yellow ≥ 70, red ≥ 90. This is a
+share of an allowance, not a context length, so it does not use the token-based
+[Ctx](#ctx) scale. A server figure carrying
 a `warning` or `critical` severity is escalated beyond what its percentage alone
 would earn; severity can only ever make the cell *more* alarming, never less.
 
@@ -1531,7 +1584,7 @@ flaky · failed · unknown-model-id · Broken task
 | Name           | `name`, else `type`               | Bold, coloured by status: green running, cyan completed, red failed, dim otherwise.                         |
 | Status         | `status`                          | Shown only when **not** running - a running row is the default case and does not need saying.               |
 | Model + effort | `model`, `effort`                 | `claude-haiku-4-5-20251001` → `Haiku 4.5`. Effort may also be a numeric token budget.                       |
-| Tokens         | `tokenCount`, `contextWindowSize` | Compact (`42k`, `1.2M`) plus a per-row context percentage, coloured on the same thresholds as the main bar. |
+| Tokens         | `tokenCount`, `contextWindowSize` | Compact (`42k`, `1.2M`), coloured on the same token-based [Ctx](#ctx) degradation scale as the main bar, followed by a dim per-row context percentage. The count carries the colour, so a row is still tiered when `contextWindowSize` is absent. |
 | Age            | `startTime`                       | Accepts epoch ms or an ISO string. Suppressed on clock skew.                                                |
 | Detail         | `label`, else `description`       | The live status line if there is one, otherwise the original task text.                                     |
 

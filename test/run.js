@@ -1075,19 +1075,53 @@ check('error and done statuses alias the failed and completed colours', () => {
   assertMatch(rowById(r, 'odd').content, `${esc}[2m${esc}[1modd-task`, 'unknown status renders dim');
 });
 
-check('token percentage thresholds: 70% turns yellow and 90% turns red', () => {
+check('the token count is coloured by degradation tier, on its lower bound', () => {
   const esc = String.fromCharCode(27);
+  // One row per tier, each sitting exactly ON the boundary, plus the row below
+  // the first boundary -- an off-by-one in the comparison shows up as two
+  // adjacent rows sharing a colour.
   const r = run(SUB, {
     columns: 90,
     tasks: [
-      { id: 'lo', name: 'lo', status: 'running', tokenCount: 100000, contextWindowSize: 200000 },
-      { id: 'mid', name: 'mid', status: 'running', tokenCount: 140000, contextWindowSize: 200000 },
-      { id: 'hi', name: 'hi', status: 'running', tokenCount: 180000, contextWindowSize: 200000 },
+      { id: 'under', name: 'under', status: 'running', tokenCount: 31999 },
+      { id: 'dilute', name: 'dilute', status: 'running', tokenCount: 32000 },
+      { id: 'rot', name: 'rot', status: 'running', tokenCount: 128000 },
+      { id: 'severe', name: 'severe', status: 'running', tokenCount: 250000 },
+      { id: 'collapse', name: 'collapse', status: 'running', tokenCount: 600000 },
     ],
   }, { env: { NO_COLOR: '' } });
-  assertMatch(rowById(r, 'lo').content, `${esc}[38;5;108m50%`, '50% green');
-  assertMatch(rowById(r, 'mid').content, `${esc}[38;5;179m70%`, '70% yellow, not green');
-  assertMatch(rowById(r, 'hi').content, `${esc}[38;5;203m90%`, '90% red, not yellow');
+  assertMatch(rowById(r, 'under').content, `${esc}[38;2;0;176;80m32k`, '31999 is still optimal');
+  assertMatch(rowById(r, 'dilute').content, `${esc}[38;2;255;215;0m32k`, '32000 is attention dilution');
+  assertMatch(rowById(r, 'rot').content, `${esc}[38;2;255;140;0m128k`, '128000 is moderate rot');
+  assertMatch(rowById(r, 'severe').content, `${esc}[38;2;255;69;0m250k`, '250000 is severe');
+  assertMatch(rowById(r, 'collapse').content, `${esc}[38;2;255;0;0m600k`, '600000 is critical collapse');
+});
+
+check('the tier follows tokens, not the percentage of the window', () => {
+  const esc = String.fromCharCode(27);
+  // Same 190k of context on two different windows. The percentages are wildly
+  // apart and the tier is identical, which is the whole point of the scale.
+  const r = run(SUB, {
+    columns: 90,
+    tasks: [
+      { id: 'small', name: 'small', status: 'running', tokenCount: 190000, contextWindowSize: 200000 },
+      { id: 'large', name: 'large', status: 'running', tokenCount: 190000, contextWindowSize: 1000000 },
+    ],
+  }, { env: { NO_COLOR: '' } });
+  assertMatch(rowById(r, 'small').content, `${esc}[38;2;255;140;0m190k`, '95% of a 200k window');
+  assertMatch(rowById(r, 'large').content, `${esc}[38;2;255;140;0m190k`, '19% of a 1M window, same tier');
+  assertMatch(rowById(r, 'small').content, '95%', 'the percentage still renders');
+  assertMatch(rowById(r, 'large').content, '19%', 'the percentage still renders');
+});
+
+check('a row with no contextWindowSize still carries a tier', () => {
+  const esc = String.fromCharCode(27);
+  const r = run(SUB, {
+    columns: 90,
+    tasks: [{ id: 'nw', name: 'nw', status: 'running', tokenCount: 300000 }],
+  }, { env: { NO_COLOR: '' } });
+  assertMatch(rowById(r, 'nw').content, `${esc}[38;2;255;69;0m300k`, 'severe, with no window to divide by');
+  assertNotMatch(rowById(r, 'nw').content, '%', 'and no percentage at all');
 });
 
 check('colour mode: the width budget counts visible glyphs, not ANSI bytes', () => {
