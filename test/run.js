@@ -61,6 +61,9 @@ function run(script, payload, opts = {}) {
       // Neutralise the host's own plugin state so tag assertions are stable.
       CAVEMAN_DEFAULT_MODE: '',
       PONYTAIL_DEFAULT_MODE: '',
+      // RTK is detected from the machine, not from the config dir, so on a
+      // machine that has it every case would otherwise spawn a real `rtk`.
+      CC_STATUSLINE_NORTK: '1',
       ...(opts.env || {}),
     },
   });
@@ -133,6 +136,33 @@ function basePayload(over = {}) {
     ...over,
   };
 }
+
+/* --- <config>/statusline/ ------------------------------------------------ */
+
+// The status line keeps its state in one file per writer under this directory.
+// Cases seed those files directly rather than driving the installer, which is
+// the only way to test a render against state no install would produce.
+const STATE_DIR = 'statusline';
+const statePath = (dir, name) => path.join(dir, STATE_DIR, name);
+
+function writeStateFile(dir, name, value) {
+  fs.mkdirSync(path.join(dir, STATE_DIR), { recursive: true });
+  fs.writeFileSync(statePath(dir, name), typeof value === 'string' ? value : JSON.stringify(value), 'utf8');
+}
+
+function readStateFile(dir, name) {
+  try {
+    return JSON.parse(fs.readFileSync(statePath(dir, name), 'utf8'));
+  } catch {
+    return {};
+  }
+}
+
+/** Merge fields into whatever state.json is already there. */
+const patchState = (dir, over) => writeStateFile(dir, 'state.json', { ...readStateFile(dir, 'state.json'), ...over });
+
+/** When a background job last fired, or undefined if it never has. */
+const jobStamp = (dir, job) => readStateFile(dir, 'jobs.json')[job];
 
 /* ========================================================================== */
 
@@ -639,9 +669,7 @@ check('a Fable delta lands in the bucket, not on the whole session', () => {
 // and the child would find no credentials in a sandbox anyway -- statusline.js
 // consults the macOS Keychain only when CLAUDE_CONFIG_DIR is unset, which it
 // never is here.
-const USAGE_FLAG = '.statusline-usage';
-const USAGE_CACHE = '.statusline-usage.json';
-const USAGE_MARKER = '.statusline-usage-check';
+const USAGE_CACHE = 'usage.json';
 
 // $10 spent in the window, $4 of it on Fable -> a 40% share. Against a 20%
 // weekly reading and the default 50% allowance the raw estimate is
@@ -675,11 +703,11 @@ function usageSandbox(id, opts = {}) {
 
   const dir = sandbox();
   fs.writeFileSync(path.join(dir, LEDGER), JSON.stringify(store), 'utf8');
-  if (flag) fs.writeFileSync(path.join(dir, USAGE_FLAG), 'on\n', 'utf8');
+  writeStateFile(dir, 'state.json', { usage: flag });
   if (limits) {
-    fs.writeFileSync(path.join(dir, USAGE_CACHE), JSON.stringify({ v: 1, at: now - ageMs, limits }), 'utf8');
+    writeStateFile(dir, USAGE_CACHE, { v: 1, at: now - ageMs, limits });
   }
-  if (marker) fs.writeFileSync(path.join(dir, USAGE_MARKER), 'test\n', 'utf8');
+  if (marker) writeStateFile(dir, 'jobs.json', { usage: now });
   return dir;
 }
 
@@ -708,26 +736,26 @@ check('the flag is required before anything is fetched', () => {
   const id = '00000000-0000-4000-8000-0000000000e2';
   const dir = usageSandbox(id, { flag: false, marker: false });
   run(MAIN, fablePayload(id), { configDir: dir });
-  assert(!fs.existsSync(path.join(dir, USAGE_MARKER)), 'a render with no flag armed the refresh');
+  assert(jobStamp(dir, 'usage') === undefined, 'a render with no opt-in armed the refresh');
 });
 
 check('the flag arms exactly one refresh per TTL', () => {
   const id = '00000000-0000-4000-8000-0000000000e3';
   const dir = usageSandbox(id, { marker: false });
   run(MAIN, fablePayload(id), { configDir: dir });
-  assert(fs.existsSync(path.join(dir, USAGE_MARKER)), 'the flag did not arm a refresh');
+  assert(jobStamp(dir, 'usage') !== undefined, 'the opt-in did not arm a refresh');
 
   // Stamped before the spawn, so the second render inside the TTL stands down.
-  const first = fs.statSync(path.join(dir, USAGE_MARKER)).mtimeMs;
+  const first = jobStamp(dir, 'usage');
   run(MAIN, fablePayload(id), { configDir: dir });
-  assert(fs.statSync(path.join(dir, USAGE_MARKER)).mtimeMs === first, 'the marker was re-stamped inside the TTL');
+  assert(jobStamp(dir, 'usage') === first, 'the stamp moved inside the TTL');
 });
 
 // --- the refresh gate. The endpoint answers for the whole account, but only a
 // model with a scoped bucket has anything to draw from it, so the full 90s
 // cadence is reserved for renders that can use the answer.
 
-const armed = (dir) => fs.existsSync(path.join(dir, USAGE_MARKER));
+const armed = (dir) => jobStamp(dir, 'usage') !== undefined;
 
 check('a model with nothing to show does not poll at the full cadence', () => {
   const id = '00000000-0000-4000-8000-0000000000f1';
@@ -821,6 +849,27 @@ check('the scope is matched by family, not by exact name', () => {
   assertMatch(r.stdout, 'Opus 3%', 'server name "Opus" against a full display string');
 });
 
+check('the shipped sources contain no CR bytes', () => {
+  // .gitattributes pins every source file to LF and explains why: these
+  // scripts assert they carry no raw control bytes, and the transcript reader
+  // tracks byte offsets, so a line-ending rewrite changes counts the suite is
+  // otherwise blind to. Nothing enforced it until now, and editors and
+  // refactoring tools have reintroduced CRLF here more than once -- always
+  // invisibly, because a CRLF file behaves normally right up until an offset
+  // is compared against a byte count.
+  //
+  // Built with fromCharCode rather than typed, for the same reason the escape
+  // sequences below are: a literal CR in this file would be the very thing
+  // under test.
+  const CR = String.fromCharCode(13);
+  for (const file of [MAIN, SUB, INSTALL]) {
+    const raw = fs.readFileSync(file, 'utf8');
+    const count = raw.split(CR).length - 1;
+    assert(count === 0,
+      `${path.basename(file)} carries ${count} CR byte(s); .gitattributes pins it to LF`);
+  }
+});
+
 check('severity can only make the cell more alarming, never less', () => {
   const id = '00000000-0000-4000-8000-0000000000ea';
   const dir = usageSandbox(id, { limits: usageLimits(3, 'critical') });
@@ -847,18 +896,18 @@ check('a cached model name cannot smuggle escape sequences into the terminal', (
 check('an oversized or corrupt cache is ignored, not fatal', () => {
   const id = '00000000-0000-4000-8000-0000000000ec';
   const dir = usageSandbox(id, { limits: usageLimits(8) });
-  fs.writeFileSync(path.join(dir, USAGE_CACHE), '{ not json at all', 'utf8');
+  writeStateFile(dir, USAGE_CACHE, '{ not json at all');
   const r = run(MAIN, fablePayload(id), { configDir: dir });
   assert(r.status === 0, `exit ${r.status}`);
   assertMatch(r.stdout, `Fable ~${RAW_FABLE_PCT}%`, 'fell back to the estimate');
 });
 
-check('CC_STATUSLINE_USAGE=0 overrides the flag file', () => {
+check('CC_STATUSLINE_USAGE=0 overrides the opt-in', () => {
   const id = '00000000-0000-4000-8000-0000000000ed';
   const dir = usageSandbox(id, { limits: usageLimits(8), marker: false });
   const r = run(MAIN, fablePayload(id), { configDir: dir, env: { CC_STATUSLINE_USAGE: '0' } });
   assertMatch(r.stdout, `Fable ~${RAW_FABLE_PCT}%`, 'kill switch');
-  assert(!fs.existsSync(path.join(dir, USAGE_MARKER)), 'the kill switch still armed a refresh');
+  assert(jobStamp(dir, 'usage') === undefined, 'the kill switch still armed a refresh');
 });
 
 check('the refresh child writes nothing when it cannot find a credential', () => {
@@ -869,7 +918,7 @@ check('the refresh child writes nothing when it cannot find a credential', () =>
   });
   assert(res.status === 0, `exit ${res.status}`);
   assert(res.stdout === '', `the child printed ${JSON.stringify(res.stdout)}`);
-  assert(!fs.existsSync(path.join(dir, USAGE_CACHE)), 'a cache was written without a credential');
+  assert(!fs.existsSync(statePath(dir, USAGE_CACHE)), 'a cache was written without a credential');
 });
 
 /* --- the git-status cache ------------------------------------------------ */
@@ -963,6 +1012,91 @@ check('CC_STATUSLINE_NOCOLOR=1 alone disables colour', () => {
     env: { NO_COLOR: '', CC_STATUSLINE_NOCOLOR: '1' },
   });
   assert(!r.stdout.includes(esc), 'ANSI escapes emitted despite CC_STATUSLINE_NOCOLOR=1');
+});
+
+/* --- the RTK savings badge ----------------------------------------------- */
+
+// The badge is fed by a cache a DETACHED child writes, so every case here seeds
+// the cache by hand. Nothing in this suite may run `rtk`: a fresh entry stops
+// the render from wanting a measurement at all, and the cases that deliberately
+// leave a stale one stamp the debounce marker instead. The default env for the
+// suite sets CC_STATUSLINE_NORTK=1, so each case here opts back in explicitly --
+// which also proves the off switch is what the rest of the suite relies on.
+const RTK_CACHE = 'rtk.json';
+
+const rtkEntry = (over = {}) => ({ at: Date.now(), pct: 17.5, saved: 36817, ...over });
+
+/** @param cache object -> JSON; string -> written verbatim; null -> no file */
+function rtkSandbox(cache, opts = {}) {
+  const { marker = true } = opts;
+  const dir = sandbox();
+  if (cache !== null) writeStateFile(dir, RTK_CACHE, cache);
+  if (marker) writeStateFile(dir, 'jobs.json', { rtk: Date.now() });
+  return dir;
+}
+
+const rtkPayload = () => basePayload({ workspace: { current_dir: ROOT, project_dir: ROOT } });
+
+const rtkRun = (dir) => run(MAIN, rtkPayload(), {
+  configDir: dir,
+  env: { CC_STATUSLINE_NORTK: '' },
+});
+
+check('a fresh measurement renders as a share and a count', () => {
+  const dir = rtkSandbox({ [ROOT]: rtkEntry() });
+  // 17.5 rounds to 18; 36817 is badge-sized as 37K.
+  assertMatch(rtkRun(dir).stdout, '[RTK:18%|37K]', 'badge');
+});
+
+check('a fresh measurement is not re-measured', () => {
+  // No marker: if the render wanted a refresh it would stamp one before
+  // spawning, so its absence afterwards proves the per-project gate held.
+  const dir = rtkSandbox({ [ROOT]: rtkEntry() }, { marker: false });
+  rtkRun(dir);
+  assert(jobStamp(dir, 'rtk') === undefined, 'a fresh figure was re-measured anyway');
+});
+
+check('another project\'s measurement is not borrowed', () => {
+  const dir = rtkSandbox({ [path.join(ROOT, 'somewhere-else')]: rtkEntry() });
+  assertNotMatch(rtkRun(dir).stdout, '[RTK:', 'badge from the wrong project');
+});
+
+check('a stale measurement disappears rather than lie', () => {
+  // 31 minutes: past RTK_MAX_AGE_MS, and the marker keeps the refresh spawn
+  // this case would otherwise trigger from running the real `rtk`.
+  const dir = rtkSandbox({ [ROOT]: rtkEntry({ at: Date.now() - 31 * 60 * 1000 }) });
+  assertNotMatch(rtkRun(dir).stdout, '[RTK:', 'stale badge');
+});
+
+check('a stamp from the future is not treated as fresh', () => {
+  const dir = rtkSandbox({ [ROOT]: rtkEntry({ at: Date.now() + 60 * 60 * 1000 }) });
+  assertNotMatch(rtkRun(dir).stdout, '[RTK:', 'badge from a stepped clock');
+});
+
+check('a malformed cache renders no badge and exits 0', () => {
+  for (const body of ['not json at all', '[]', '{"' + ROOT.replace(/\\/g, '\\\\') + '":7}']) {
+    const dir = rtkSandbox(body);
+    const r = rtkRun(dir);
+    assert(r.status === 0, `exit ${r.status} on ${JSON.stringify(body.slice(0, 20))}`);
+    assertNotMatch(r.stdout, '[RTK:', 'badge from a malformed cache');
+  }
+});
+
+check('a nonsense percentage is clamped, not printed', () => {
+  const dir = rtkSandbox({ [ROOT]: rtkEntry({ pct: 4000, saved: 1284000 }) });
+  assertMatch(rtkRun(dir).stdout, '[RTK:100%|1.3M]', 'clamped badge');
+});
+
+check('a negative count is refused outright', () => {
+  const dir = rtkSandbox({ [ROOT]: rtkEntry({ saved: -5 }) });
+  assertNotMatch(rtkRun(dir).stdout, '[RTK:', 'badge from an impossible count');
+});
+
+check('CC_STATUSLINE_NORTK=1 draws nothing and measures nothing', () => {
+  const dir = rtkSandbox({ [ROOT]: rtkEntry({ at: Date.now() - 31 * 60 * 1000 }) }, { marker: false });
+  const r = run(MAIN, rtkPayload(), { configDir: dir });   // suite default is the off switch
+  assertNotMatch(r.stdout, '[RTK:', 'badge while switched off');
+  assert(jobStamp(dir, 'rtk') === undefined, 'a measurement was spawned while switched off');
 });
 
 /* ========================================================================== */
@@ -1414,10 +1548,10 @@ check('--main-only installs one half, --subagent-only the other', () => {
   assert(cfgB.subagentStatusLine && !cfgB.statusLine, 'expected subagentStatusLine only');
 });
 
-check('--interval overrides refreshInterval, which defaults to 30', () => {
+check('--interval overrides refreshInterval, which defaults to 1', () => {
   const a = sandboxPath();
   installer(['--dir', a, '--local']);
-  assert(readJson(a, 'settings.json').statusLine.refreshInterval === 30, 'default');
+  assert(readJson(a, 'settings.json').statusLine.refreshInterval === 1, 'default');
 
   const b = sandboxPath();
   installer(['--dir', b, '--local', '--interval', '5']);
@@ -1430,29 +1564,29 @@ check('a non-numeric --interval exits 1', () => {
   assertMatch(r.stderr, '--interval must be a number', 'error text');
 });
 
-check('the manifest records the sha256 of what was installed', () => {
+check('state.json records the sha256 of what was installed', () => {
   const dir = sandboxPath();
   installer(['--dir', dir, '--local']);
-  const manifest = readJson(dir, '.statusline-manifest.json');
+  const state = readStateFile(dir, 'state.json');
   for (const name of ['statusline.js', 'subagent-statusline.js']) {
     assert(
-      manifest.files[name] === sha256(fs.readFileSync(path.join(dir, name), 'utf8')),
-      `${name}: manifest hash does not match the installed bytes`
+      state.files[name] === sha256(fs.readFileSync(path.join(dir, name), 'utf8')),
+      `${name}: recorded hash does not match the installed bytes`
     );
   }
-  assert(manifest.ref === 'main', `unexpected ref ${manifest.ref}`);
+  assert(state.ref === 'main', `unexpected ref ${state.ref}`);
 });
 
 check('auto-update is off unless asked for, and can be turned back off', () => {
   const dir = sandboxPath();
   installer(['--dir', dir, '--local']);
-  assert(!exists(dir, '.statusline-autoupdate'), 'must be off by default');
+  assert(readStateFile(dir, 'state.json').autoUpdate === false, 'must be off by default');
 
   installer(['--dir', dir, '--local', '--auto-update']);
-  assert(exists(dir, '.statusline-autoupdate'), '--auto-update did not set the flag');
+  assert(readStateFile(dir, 'state.json').autoUpdate === true, '--auto-update did not set it');
 
   installer(['--dir', dir, '--local', '--no-auto-update']);
-  assert(!exists(dir, '.statusline-autoupdate'), '--no-auto-update did not clear the flag');
+  assert(readStateFile(dir, 'state.json').autoUpdate === false, '--no-auto-update did not clear it');
 });
 
 check('reinstalling over an install is idempotent', () => {
@@ -1503,9 +1637,10 @@ check('--uninstall removes our keys and files but keeps the ledger', () => {
   assert(cfg.subagentStatusLine === undefined, 'subagentStatusLine key survived');
   assert(cfg.model === 'opus', 'an unrelated key was removed');
 
-  for (const name of ['statusline.js', 'subagent-statusline.js', '.statusline-manifest.json', '.statusline-autoupdate']) {
+  for (const name of ['statusline.js', 'subagent-statusline.js', path.join(STATE_DIR, 'state.json')]) {
     assert(!exists(dir, name), `${name} survived`);
   }
+  assert(!exists(dir, STATE_DIR), 'the state directory survived');
   assert(exists(dir, 'cost_ledger.json'), 'the ledger must be kept without --purge');
 });
 
@@ -1560,52 +1695,139 @@ check('a locally edited statusline is never overwritten', () => {
   assert(fs.readFileSync(file, 'utf8') === before, 'an edited file was reverted');
 });
 
-check('no manifest means no update attempt, and no output', () => {
+check('no recorded baseline means no update attempt, and no output', () => {
   const dir = sandboxPath();
   installer(['--dir', dir, '--local', '--main-only']);
-  fs.unlinkSync(path.join(dir, '.statusline-manifest.json'));
+  fs.unlinkSync(statePath(dir, 'state.json'));
   const file = path.join(dir, 'statusline.js');
   const before = fs.readFileSync(file, 'utf8');
 
   const r = runUpdateChild(dir);
   assert(r.status === 0, `exit ${r.status}`);
   assert(r.stdout === '', `expected silence, got ${JSON.stringify(r.stdout)}`);
-  assert(fs.readFileSync(file, 'utf8') === before, 'the script changed without a manifest');
+  assert(fs.readFileSync(file, 'utf8') === before, 'the script changed without a baseline');
 });
 
-check('a render leaves no update marker while auto-update is off', () => {
+check('a render leaves no update stamp while auto-update is off', () => {
   const dir = sandboxPath();
   installer(['--dir', dir, '--local']);
   run(path.join(dir, 'statusline.js'), basePayload(), { configDir: dir });
-  assert(!exists(dir, '.statusline-last-update'), 'the updater ran while disabled');
+  assert(jobStamp(dir, 'update') === undefined, 'the updater ran while disabled');
 });
 
-check('a render stamps the marker at most once a day', () => {
+check('a render stamps the update job at most once a day', () => {
   const dir = sandboxPath();
   installer(['--dir', dir, '--local']);
-  // Removing the manifest makes the detached child a no-op, so this case
-  // exercises the render-path half without going near the network.
-  fs.unlinkSync(path.join(dir, '.statusline-manifest.json'));
-  fs.writeFileSync(path.join(dir, '.statusline-autoupdate'), '');
+  // Dropping the recorded hashes makes the detached child a no-op, so this
+  // case exercises the render-path half without going near the network.
+  patchState(dir, { files: undefined, autoUpdate: true });
 
-  const marker = path.join(dir, '.statusline-last-update');
   run(path.join(dir, 'statusline.js'), basePayload(), { configDir: dir });
-  assert(fs.existsSync(marker), 'the marker was not stamped');
+  const stamp = jobStamp(dir, 'update');
+  assert(stamp !== undefined, 'the job was not stamped');
 
-  const stamp = fs.readFileSync(marker, 'utf8');
   run(path.join(dir, 'statusline.js'), basePayload(), { configDir: dir });
-  assert(fs.readFileSync(marker, 'utf8') === stamp, 're-stamped within the day');
+  assert(jobStamp(dir, 'update') === stamp, 're-stamped within the day');
 });
 
-check('a render is unaffected by a broken manifest', () => {
+check('a render is unaffected by a broken state file', () => {
   const dir = sandboxPath();
   installer(['--dir', dir, '--local']);
-  fs.writeFileSync(path.join(dir, '.statusline-manifest.json'), 'not json');
-  fs.writeFileSync(path.join(dir, '.statusline-autoupdate'), '');
+  writeStateFile(dir, 'state.json', 'not json');
 
   const r = run(path.join(dir, 'statusline.js'), basePayload(), { configDir: dir });
   assert(r.status === 0, `exit ${r.status}`);
   assert(r.lines.length >= 3, `expected >=3 lines, got ${r.lines.length}`);
+});
+
+/* ========================================================================== */
+
+console.log('\nlegacy layout\n');
+
+/* --- the old .statusline-* layout ---------------------------------------- */
+
+// Every case above uses the consolidated layout. These cover the upgrade path:
+// a statusline.js that has self-updated but whose install.js has not been re-run
+// is still looking at eight dotfiles at the top of the config dir, and must keep
+// working until the installer moves them.
+
+check('a legacy RTK cache is still read', () => {
+  const dir = sandbox();
+  fs.writeFileSync(path.join(dir, '.statusline-rtk.json'), JSON.stringify({ [ROOT]: rtkEntry() }), 'utf8');
+  writeStateFile(dir, 'jobs.json', { rtk: Date.now() });
+  assertMatch(rtkRun(dir).stdout, '[RTK:18%|37K]', 'badge from the old path');
+});
+
+check('a cache at the new path wins over one left at the old', () => {
+  // Ordering matters in one direction only: the new file is written after the
+  // move, so a legacy file that outlives it is by definition the older figure.
+  const dir = rtkSandbox({ [ROOT]: rtkEntry({ pct: 40, saved: 1000 }) });
+  fs.writeFileSync(path.join(dir, '.statusline-rtk.json'), JSON.stringify({ [ROOT]: rtkEntry() }), 'utf8');
+  assertMatch(rtkRun(dir).stdout, '[RTK:40%|1K]', 'the stale legacy cache won');
+});
+
+check('a legacy usage opt-in still arms the refresh', () => {
+  // No state.json at all: the flag file is the only thing saying it is on.
+  const dir = sandbox();
+  fs.writeFileSync(path.join(dir, '.statusline-usage'), 'on\n', 'utf8');
+  run(MAIN, fablePayload('00000000-0000-4000-8000-0000000000b1'), { configDir: dir });
+  assert(jobStamp(dir, 'usage') !== undefined, 'the legacy flag did not arm a refresh');
+});
+
+check('a legacy auto-update flag and manifest still arm the updater', () => {
+  const dir = sandboxPath();
+  installer(['--dir', dir, '--local']);
+  fs.unlinkSync(statePath(dir, 'state.json'));           // an install that predates it
+  fs.writeFileSync(path.join(dir, '.statusline-autoupdate'), '');
+  // Hashes that match nothing on disk: the child stands down at the baseline
+  // comparison, so this case never reaches the network.
+  fs.writeFileSync(
+    path.join(dir, '.statusline-manifest.json'),
+    JSON.stringify({ files: { 'statusline.js': 'f'.repeat(64) } })
+  );
+
+  run(path.join(dir, 'statusline.js'), basePayload(), { configDir: dir });
+  assert(jobStamp(dir, 'update') !== undefined, 'the legacy flag did not arm the updater');
+});
+
+check('installing migrates the old layout and removes it', () => {
+  const dir = sandbox();
+  const legacy = {
+    '.statusline-manifest.json': '{"files":{}}',
+    '.statusline-autoupdate': '',
+    '.statusline-last-update': 'x',
+    '.statusline-usage': 'on',
+    '.statusline-usage-check': 'x',
+    '.statusline-rtk-check': 'x',
+    '.statusline-usage.json': JSON.stringify({ v: 1, at: Date.now(), limits: [] }),
+    '.statusline-rtk.json': JSON.stringify({ [ROOT]: rtkEntry() }),
+  };
+  for (const [name, body] of Object.entries(legacy)) {
+    fs.writeFileSync(path.join(dir, name), body, 'utf8');
+  }
+
+  // --usage because the opt-in is decided by this run's flags, exactly as it was
+  // when it lived in a file: without it the install would (correctly) turn the
+  // endpoint off and drop the snapshot it had just migrated.
+  installer(['--dir', dir, '--local', '--usage']);
+
+  for (const name of Object.keys(legacy)) {
+    assert(!exists(dir, name), `${name} survived the migration`);
+  }
+  assert(exists(dir, path.join(STATE_DIR, 'rtk.json')), 'the RTK cache was not moved');
+  assert(exists(dir, path.join(STATE_DIR, 'usage.json')), 'the usage cache was not moved');
+  assert(readStateFile(dir, 'state.json').usage === true, 'the opt-in did not land in state.json');
+});
+
+check('uninstall removes the old layout too', () => {
+  const dir = sandbox();
+  installer(['--dir', dir, '--local']);
+  const stragglers = ['.statusline-manifest.json', '.statusline-usage.json', '.statusline-rtk-check'];
+  for (const name of stragglers) fs.writeFileSync(path.join(dir, name), 'x', 'utf8');
+
+  installer(['--dir', dir, '--uninstall']);
+  for (const name of stragglers) assert(!exists(dir, name), `${name} survived the uninstall`);
+  assert(!exists(dir, STATE_DIR), 'the state directory survived');
 });
 
 /* ========================================================================== */

@@ -24,10 +24,13 @@
  *   <config>/settings.json              statusLine + subagentStatusLine keys,
  *                                       backed up to settings.json.bak first,
  *                                       every other key preserved
- *   <config>/.statusline-manifest.json  sha256 of what we installed, so the
- *                                       auto-updater can detect local edits
- *   <config>/.statusline-autoupdate     flag file, only with --auto-update
- *   <config>/.statusline-usage          flag file, only with --usage
+ *   <config>/statusline/state.json      sha256 of what we installed, so the
+ *                                       auto-updater can detect local edits,
+ *                                       plus the --auto-update and --usage
+ *                                       opt-ins
+ *   <config>/statusline/*.json          caches and job stamps the status line
+ *                                       writes itself; migrated from the old
+ *                                       <config>/.statusline-* dotfiles
  *
  *   <config> is $CLAUDE_CONFIG_DIR, else ~/.claude. Never anything outside it.
  *   The cost ledger is user data and is never written or deleted by default.
@@ -53,18 +56,32 @@ const REPO = 'GridFlowTech/claude-statusline';
 const MAIN = 'statusline.js';
 const SUB = 'subagent-statusline.js';
 
-const MANIFEST = '.statusline-manifest.json';
-const AUTOUPDATE_FLAG = '.statusline-autoupdate';
-const UPDATE_MARKER = '.statusline-last-update';
+// Everything we keep lives in <config>/statusline/, one file per writer. The
+// installer owns state.json -- the install hashes plus both opt-ins, including
+// the usage endpoint, which is the only thing here that reaches the network
+// with the user's credential and so must never start without being asked for.
+// The status line owns the rest and recreates them as needed.
+const STATE_DIR = 'statusline';
+const STATE_FILE = 'state.json';
+const JOBS_FILE = 'jobs.json';
+const USAGE_CACHE = 'usage.json';
+const RTK_CACHE = 'rtk.json';
 
-// Opt-in for the OAuth usage endpoint: with this flag present the status line
-// refreshes the server's own per-model weekly figure in a detached child every
-// ~90s. Off by default, on the same terms as auto-update -- it is the only
-// thing here that reaches the network with the user's credential, and that
-// should never start without being asked for.
-const USAGE_FLAG = '.statusline-usage';
-const USAGE_CACHE = '.statusline-usage.json';
-const USAGE_MARKER = '.statusline-usage-check';
+// The layout before those four files existed: eight dotfiles at the top level
+// of <config>. Migrated on install, removed on uninstall, and still readable
+// by a statusline.js that has self-updated but not been re-installed.
+const LEGACY_CACHES = {
+  '.statusline-usage.json': USAGE_CACHE,
+  '.statusline-rtk.json': RTK_CACHE,
+};
+const LEGACY_FILES = [
+  '.statusline-manifest.json',
+  '.statusline-autoupdate',
+  '.statusline-last-update',
+  '.statusline-usage',
+  '.statusline-usage-check',
+  '.statusline-rtk-check',
+];
 
 // Minimum plausible size for either script. A 404 body, a Cloudflare interstitial
 // or a truncated transfer all land far under this.
@@ -94,7 +111,7 @@ function parseArgs(argv) {
   const opts = {
     dir: null,
     ref: 'main',
-    interval: 30,
+    interval: 1,
     source: 'auto',      // auto | local | remote
     scope: 'both',       // both | main | subagent
     autoUpdate: false,
@@ -161,7 +178,7 @@ Options
   --no-usage          turn the usage endpoint back off and delete its cache
   --main-only         install the status line, not the subagent panel
   --subagent-only     install the subagent panel, not the status line
-  --interval <sec>    statusLine refreshInterval (default 30)
+  --interval <sec>    statusLine refreshInterval (default 1)
   --ref <branch|tag>  install from a specific ref (default main)
   --dir <path>        target config dir (default $CLAUDE_CONFIG_DIR or ~/.claude)
   --local | --remote  force copying from this checkout, or downloading
@@ -353,6 +370,69 @@ function writeAtomic(dest, content) {
   fs.renameSync(tmp, dest);
 }
 
+/**
+ * What the last install left behind: the new state file, or the old manifest
+ * and flag files rebuilt into its shape. `{}` when there is neither.
+ *
+ * Only used for messaging -- what gets written is decided by this run's flags,
+ * exactly as it was when the opt-ins were files.
+ */
+function readState(dir) {
+  const read = (p) => {
+    try {
+      const v = JSON.parse(fs.readFileSync(p, 'utf8'));
+      return v && typeof v === 'object' ? v : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const state = read(path.join(dir, STATE_DIR, STATE_FILE));
+  if (state) return state;
+
+  const present = (name) => fs.existsSync(path.join(dir, name));
+  return {
+    ...(read(path.join(dir, '.statusline-manifest.json')) || {}),
+    autoUpdate: present('.statusline-autoupdate'),
+    usage: present('.statusline-usage'),
+  };
+}
+
+/**
+ * Move the old dotfiles into <config>/statusline/ and delete what is left.
+ *
+ * Only the two caches carry anything worth keeping. The flags and the manifest
+ * have already been folded into state.json by the caller, and the three job
+ * markers are debounce stamps -- losing them costs one early run of each
+ * background job and nothing else.
+ *
+ * @returns how many files it removed or moved, for the caller to report.
+ */
+function migrateLegacy(dir) {
+  let touched = 0;
+
+  for (const [from, to] of Object.entries(LEGACY_CACHES)) {
+    const legacy = path.join(dir, from);
+    if (!fs.existsSync(legacy)) continue;
+    try {
+      const dest = path.join(dir, STATE_DIR, to);
+      // A cache already written at the new path is newer than this one by
+      // definition -- the status line only writes there after the move.
+      if (fs.existsSync(dest)) fs.unlinkSync(legacy);
+      else fs.renameSync(legacy, dest);
+      touched++;
+    } catch { /* best effort: a file we cannot move is left where it is */ }
+  }
+
+  for (const name of LEGACY_FILES) {
+    const legacy = path.join(dir, name);
+    if (!fs.existsSync(legacy)) continue;
+    try { fs.unlinkSync(legacy); touched++; } catch { /* best effort */ }
+  }
+
+  return touched;
+}
+
 function readSettings(file) {
   let raw;
   try {
@@ -372,7 +452,7 @@ function readSettings(file) {
     die(
       `${file} is not valid JSON (${err.message}).\n` +
       'Refusing to touch it. Fix the syntax and re-run, or add these keys by hand:\n\n' +
-      '  "statusLine": { "type": "command", "command": "node \\"~/.claude/statusline.js\\"", "refreshInterval": 30 },\n' +
+      '  "statusLine": { "type": "command", "command": "node \\"~/.claude/statusline.js\\"", "refreshInterval": 1 },\n' +
       '  "subagentStatusLine": { "type": "command", "command": "node \\"~/.claude/subagent-statusline.js\\"" }'
     );
   }
@@ -424,11 +504,21 @@ async function install(opts) {
     }
   }
 
-  // Files.
-  const manifest = { repo: REPO, ref: opts.ref, installedAt: new Date().toISOString(), files: {} };
+  // Files. The opt-ins are fields on the same object the hashes live on, so a
+  // half-written install cannot leave a flag on and a baseline missing.
+  const prior = readState(dir);
+  const state = {
+    v: 1,
+    repo: REPO,
+    ref: opts.ref,
+    installedAt: new Date().toISOString(),
+    files: {},
+    autoUpdate: opts.autoUpdate === true,
+    usage: opts.usage === true,
+  };
   for (const name of files) {
     const dest = path.join(dir, name);
-    manifest.files[name] = sha256(loaded[name]);
+    state.files[name] = sha256(loaded[name]);
     if (!opts.dryRun) writeAtomic(dest, loaded[name]);
     say(`${tag}wrote    ${posix(dest)}`);
   }
@@ -451,37 +541,34 @@ async function install(opts) {
 
   if (!opts.dryRun) {
     writeAtomic(settingsFile, JSON.stringify(cfg, null, 2) + '\n');
-    // The manifest records what a clean install looks like. The auto-updater
+    // state.json records what a clean install looks like. The auto-updater
     // compares against it and stands down if you have edited a file since.
-    writeAtomic(path.join(dir, MANIFEST), JSON.stringify(manifest, null, 2) + '\n');
+    fs.mkdirSync(path.join(dir, STATE_DIR), { recursive: true });
+    writeAtomic(path.join(dir, STATE_DIR, STATE_FILE), JSON.stringify(state, null, 2) + '\n');
+    say(`${tag}wrote    ${posix(path.join(dir, STATE_DIR, STATE_FILE))}`);
+
+    const migrated = migrateLegacy(dir);
+    if (migrated) say(`${tag}migrated ${migrated} file(s) from the old .statusline-* layout`);
   }
 
-  // Auto-update flag.
-  const flag = path.join(dir, AUTOUPDATE_FLAG);
-  if (opts.autoUpdate) {
-    if (!opts.dryRun) writeAtomic(flag, `${manifest.installedAt}\n`);
-    say(`${tag}enabled  daily auto-update (${AUTOUPDATE_FLAG})`);
-  } else if (fs.existsSync(flag)) {
-    if (!opts.dryRun) { try { fs.unlinkSync(flag); } catch { /* best effort */ } }
-    say(`${tag}disabled auto-update`);
-  }
+  say(
+    opts.autoUpdate ? `${tag}enabled  daily auto-update`
+      : prior.autoUpdate ? `${tag}disabled auto-update`
+      : `${tag}off      auto-update (--auto-update turns it on)`
+  );
 
-  // Usage-endpoint flag. Turning it off also drops the cached snapshot: a stale
+  // Turning the usage endpoint off also drops the cached snapshot: a stale
   // figure left on disk would be read by nothing, and leaving account data
   // behind after the user opted out is the wrong default.
-  const usageFlag = path.join(dir, USAGE_FLAG);
   if (opts.usage) {
-    if (!opts.dryRun) writeAtomic(usageFlag, `${manifest.installedAt}\n`);
-    say(`${tag}enabled  usage endpoint (${USAGE_FLAG})`);
+    say(`${tag}enabled  usage endpoint`);
     if (process.platform === 'darwin') {
       say('         macOS: the first refresh raises one Keychain prompt for');
       say('         "Claude Code-credentials" -- answer "Always Allow".');
     }
-  } else if (fs.existsSync(usageFlag)) {
+  } else if (prior.usage) {
     if (!opts.dryRun) {
-      for (const name of [USAGE_FLAG, USAGE_CACHE, USAGE_MARKER]) {
-        try { fs.unlinkSync(path.join(dir, name)); } catch { /* best effort */ }
-      }
+      try { fs.unlinkSync(path.join(dir, STATE_DIR, USAGE_CACHE)); } catch { /* best effort */ }
     }
     say(`${tag}disabled usage endpoint`);
   }
@@ -518,9 +605,15 @@ function uninstall(opts) {
     if (!opts.dryRun) writeAtomic(settingsFile, JSON.stringify(cfg, null, 2) + '\n');
   }
 
-  // Markers only go when the whole thing goes.
+  // State only goes when the whole thing goes. Both layouts are listed: an
+  // install old enough to predate <config>/statusline/ must still uninstall
+  // cleanly, and one that straddles the change has files in both places.
   const extras = opts.scope === 'both'
-    ? [MANIFEST, AUTOUPDATE_FLAG, UPDATE_MARKER, USAGE_FLAG, USAGE_CACHE, USAGE_MARKER]
+    ? [
+        ...[STATE_FILE, JOBS_FILE, USAGE_CACHE, RTK_CACHE].map((n) => path.join(STATE_DIR, n)),
+        ...LEGACY_FILES,
+        ...Object.keys(LEGACY_CACHES),
+      ]
     : [];
   // cost_ledger.json is your cost history, not our file. --purge only.
   const ledger = opts.purge ? ['cost_ledger.json'] : [];
@@ -530,6 +623,12 @@ function uninstall(opts) {
     if (!fs.existsSync(target)) continue;
     if (!opts.dryRun) { try { fs.unlinkSync(target); } catch { continue; } }
     say(`${tag}deleted  ${posix(target)}`);
+  }
+
+  // Only when it is ours and empty: a directory someone else put files in is
+  // not ours to delete, and rmdir refusing a non-empty one says exactly that.
+  if (opts.scope === 'both' && !opts.dryRun) {
+    try { fs.rmdirSync(path.join(dir, STATE_DIR)); } catch { /* not empty, or not there */ }
   }
 
   if (!opts.purge && fs.existsSync(path.join(dir, 'cost_ledger.json'))) {

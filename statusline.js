@@ -210,19 +210,17 @@ const FABLE_WEEKLY_SHARE = (() => {
  * rate limited) still debounces for a full TTL instead of re-arming on every
  * render.
  *
- * OFF unless <config>/.statusline-usage exists, on the same terms as the
- * self-updater and for the same reason: this is a status bar reaching out to
- * the network with the user's credential, and nothing a status bar does should
- * surprise anyone. `install.js --usage` creates the flag, `--no-usage` removes
- * it. While it is absent the whole feature costs one statSync per render and
- * fableCell() behaves exactly as it did before this existed.
+ * OFF unless `usage` is set in <config>/statusline/state.json, on the same
+ * terms as the self-updater and for the same reason: this is a status bar
+ * reaching out to the network with the user's credential, and nothing a status
+ * bar does should surprise anyone. `install.js --usage` sets it, `--no-usage`
+ * clears it. While it is off, fableCell() behaves exactly as it did before
+ * this existed and no request is ever made.
  *
  *   install.js --usage           opt in
  *   CC_STATUSLINE_USAGE=0        force off even with the flag present
  *   CC_STATUSLINE_USAGE_TTL=90   seconds between refreshes
  * ------------------------------------------------------------------------ */
-
-const USAGE_FLAG_FILE = '.statusline-usage';
 
 // The env var is a kill switch, not the switch: it can only turn the feature
 // off. Opting IN is a deliberate on-disk act, so that a stray environment
@@ -251,8 +249,9 @@ const USAGE_PATH = '/api/oauth/usage';
 const USAGE_BETA = 'oauth-2025-04-20';
 const USAGE_TIMEOUT_MS = 10000;
 const USAGE_MAX_BYTES = 256 * 1024;   // the real response is ~1.5 KB
-const USAGE_CACHE_FILE = '.statusline-usage.json';
-const USAGE_CHECK_FILE = '.statusline-usage-check';
+const USAGE_CACHE_FILE = 'usage.json';
+const LEGACY_USAGE_CACHE = '.statusline-usage.json';
+const USAGE_JOB = 'usage';
 
 /* ---------------------------------------------------------------------------
  * Estimator calibration
@@ -330,6 +329,7 @@ const green = (s) => paint('38;5;108', s);
 const cyan = (s) => paint('38;5;110', s);
 const orange = (s) => paint('38;5;172', s);   // caveman plugin's own colour
 const sage = (s) => paint('38;5;108', s);     // ponytail plugin's own colour
+const rust = (s) => paint('38;5;166', s);     // rtk, kept clear of caveman's 172
 const magenta = (s) => paint('38;5;176', s);  // git branch
 
 const SEP = dim(' · ');                   // " · "
@@ -493,36 +493,191 @@ function claudeDir() {
   return process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
 }
 
+/* ---------------------------------------------------------------------------
+ * On-disk state
+ * ----------------------------------------------------------------------------
+ * Everything this script keeps lives under <config>/statusline/, in one file
+ * per WRITER rather than one file per fact:
+ *
+ *   state.json   installer-owned: the install hashes plus the two opt-ins
+ *   jobs.json    render-owned: when each background job last fired
+ *   usage.json   written only by the --usage-refresh child
+ *   rtk.json     written only by the --rtk-refresh child
+ *
+ * Grouping by writer is what makes one file per group safe. No two processes
+ * ever read-modify-write the same file, so no snapshot can be clobbered by an
+ * unrelated update, and each write still lands atomically through tmp+rename.
+ * The three background jobs share jobs.json because only the render process
+ * ever stamps them -- and two concurrent renders racing there cost at most one
+ * extra spawn, which is what a debounce is allowed to get wrong.
+ *
+ * Before this, the same state was eight dotfiles directly under <config>. Every
+ * reader below falls back to its old path when the new one is absent, so a
+ * statusline that self-updates before install.js is re-run keeps its opt-ins
+ * and its cached figures. The installer migrates the files on its next run, and
+ * once the new file exists the fallback is never consulted again.
+ * ------------------------------------------------------------------------ */
+
+const STATE_DIR = 'statusline';
+const STATE_FILE = 'state.json';
+const JOBS_FILE = 'jobs.json';
+
+// The pre-consolidation layout, kept only so an upgrade loses nothing.
+const LEGACY_MANIFEST = '.statusline-manifest.json';
+const LEGACY_AUTOUPDATE = '.statusline-autoupdate';
+const LEGACY_USAGE_FLAG = '.statusline-usage';
+
+// Nothing here is ever this big. A file that is has been replaced by something
+// that is not ours, and reading it into memory is the wrong move either way.
+const STATE_MAX_BYTES = 64 * 1024;
+
+function statePath(name) { return path.join(claudeDir(), STATE_DIR, name); }
+
+/**
+ * Parse a small JSON file, or null.
+ *
+ * lstat, not stat: these files sit in a shared config directory and their
+ * contents reach a terminal, so a symlink is refused rather than followed and
+ * an implausible size is refused rather than read. Absent, unreadable, corrupt
+ * and hostile all collapse to the same answer, which every caller already
+ * handles as "no data yet".
+ */
+function readJsonFile(file, maxBytes) {
+  try {
+    const st = fs.lstatSync(file, { throwIfNoEntry: false });
+    if (!st || !st.isFile() || st.isSymbolicLink() || st.size > (maxBytes || STATE_MAX_BYTES)) return null;
+    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Write JSON through tmp+rename, creating the directory if needed.
+ * @returns true on success. Never throws: every caller's fallback is "the
+ * previous contents stay, and the next run tries again".
+ */
+function writeJsonFile(file, value) {
+  const tmp = `${file}.${process.pid}.tmp`;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(tmp, JSON.stringify(value), 'utf8');
+    fs.renameSync(tmp, file);   // atomic: a reader can never see a partial file
+    return true;
+  } catch {
+    try { fs.unlinkSync(tmp); } catch { /* nothing else to do */ }
+    return false;
+  }
+}
+
+/**
+ * Read a cache that may still be at its old path.
+ *
+ * Costs one extra lstat only while the new file is missing -- which is the
+ * window between a self-update and the next refresh, and nothing at all after
+ * that. Ordering matters: the new path wins, so a stale legacy file left behind
+ * by a partial uninstall can never override a live measurement.
+ */
+function readJsonWithLegacy(file, legacyName, maxBytes) {
+  return readJsonFile(file, maxBytes) || readJsonFile(path.join(claudeDir(), legacyName), maxBytes);
+}
+
+/**
+ * Installer-written state: `{ files, repo, ref, autoUpdate, usage }`.
+ *
+ * Memoised. An installer cannot run to completion inside the lifetime of one
+ * render, and three separate call sites ask -- the usage gate, the self-update
+ * gate, and the updater itself.
+ */
+let stateMemo;
+function readState() {
+  if (stateMemo === undefined) stateMemo = readJsonFile(statePath(STATE_FILE)) || legacyState() || {};
+  return stateMemo;
+}
+
+/**
+ * The old layout rebuilt into the shape readState() returns: a manifest file
+ * plus two flag files whose mere existence was the value.
+ *
+ * Returns null when none of the three is present, so a fresh install with no
+ * state at all is not mistaken for one that opted out of everything.
+ */
+function legacyState() {
+  const dir = claudeDir();
+  const present = (name) => {
+    try {
+      return fs.statSync(path.join(dir, name), { throwIfNoEntry: false }) !== undefined;
+    } catch {
+      return false;
+    }
+  };
+
+  const manifest = readJsonFile(path.join(dir, LEGACY_MANIFEST));
+  const autoUpdate = present(LEGACY_AUTOUPDATE);
+  const usage = present(LEGACY_USAGE_FLAG);
+  if (!manifest && !autoUpdate && !usage) return null;
+  return { ...(manifest || {}), autoUpdate, usage };
+}
+
+/**
+ * When each background job last fired, in epoch ms, keyed by job name.
+ *
+ * Memoised and mutated in place by spawnDebounced, so a render that fires two
+ * jobs writes both stamps rather than losing the first to a re-read.
+ */
+let jobsMemo;
+function readJobs() {
+  if (jobsMemo === undefined) jobsMemo = readJsonFile(statePath(JOBS_FILE)) || {};
+  return jobsMemo;
+}
+
 /**
  * Spawn `statusline.js <flag>` detached, at most once per `intervalMs`, using
- * the mtime of `<config>/<markerFile>` as the debounce.
+ * `job`'s stamp in jobs.json as the debounce.
  *
- * Both background jobs -- the self-updater and the usage refresh -- want
- * exactly this, and they want it to behave IDENTICALLY. The marker is stamped
- * BEFORE the spawn, never after: two renders can overlap inside the 300ms
- * debounce, and a job that fails must still wait out the interval rather than
- * re-arming on every render for the rest of it.
+ * All three background jobs -- the self-updater, the usage refresh and the RTK
+ * measurement -- want exactly this, and they want it to behave IDENTICALLY.
+ * The stamp is written BEFORE the spawn, never after: two renders can overlap
+ * inside the 300ms debounce, and a job that fails must still wait out its
+ * interval rather than re-arming on every render for the rest of it.
  *
  * Never throws, and is only ever called after stdout has been written, so
  * nothing here can delay or disturb a frame.
+ *
+ * @param job one of 'update' | 'usage' | 'rtk', the key in jobs.json
+ * @param cwd optional working directory for the child; inherited when absent.
  */
-function spawnDebounced(markerFile, intervalMs, flag) {
+function spawnDebounced(job, intervalMs, flag, cwd) {
   try {
-    const marker = path.join(claudeDir(), markerFile);
-    const stamp = fs.statSync(marker, { throwIfNoEntry: false });
+    const jobs = readJobs();
+    const stamp = num(jobs[job]);
     // `age >= 0` rejects a stamp from the future: a clock stepping backwards
     // (NTP correction, VM resume, a restored backup) would otherwise pin the
     // job until real time caught up again.
-    const age = stamp ? Date.now() - stamp.mtimeMs : Infinity;
+    const age = stamp === null ? Infinity : Date.now() - stamp;
     if (age >= 0 && age < intervalMs) return;
 
-    fs.mkdirSync(path.dirname(marker), { recursive: true });
-    fs.writeFileSync(marker, new Date().toISOString() + '\n');
+    // The memo is mutated as well as the file, so a render that fires two jobs
+    // writes both stamps instead of the second overwriting the first.
+    jobs[job] = Date.now();
+    writeJsonFile(statePath(JOBS_FILE), jobs);
 
     require('child_process')
       .spawn(process.execPath, [__filename, flag], {
         detached: true, stdio: 'ignore', windowsHide: true,
+        // Only the RTK job passes one: `rtk gain -p` reads its project from
+        // the directory it runs in, so that child must start in the project
+        // rather than wherever the host happened to launch this render.
+        cwd: cwd || undefined,
       })
+      // A failed spawn arrives as an asynchronous 'error' event, AFTER this
+      // function has returned and its try/catch is long gone. Unhandled, that
+      // event is a thrown exception at the top level: the frame is already on
+      // screen, but the process dies non-zero and the host logs a render
+      // error every single time. A cwd that no longer exists (deleted repo,
+      // unmounted share) is enough to hit it.
+      .on('error', () => {})
       .unref();   // let this process exit while the child carries on
   } catch {
     /* a background job that cannot start is no reason to disturb the bar */
@@ -625,15 +780,23 @@ function readFlagFile(file) {
   }
 }
 
-function readConfigMode(pluginName) {
+/**
+ * Where a tool of this shape keeps its user config, most specific location
+ * first. Shared by the plugin mode readers and the RTK probe so a machine
+ * that configures one of them somewhere unusual is found by all of them.
+ */
+function configDirs(name) {
   const dirs = [];
-  if (process.env.XDG_CONFIG_HOME) dirs.push(path.join(process.env.XDG_CONFIG_HOME, pluginName));
+  if (process.env.XDG_CONFIG_HOME) dirs.push(path.join(process.env.XDG_CONFIG_HOME, name));
   if (process.platform === 'win32') {
-    dirs.push(path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), pluginName));
+    dirs.push(path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), name));
   }
-  dirs.push(path.join(os.homedir(), '.config', pluginName));
+  dirs.push(path.join(os.homedir(), '.config', name));
+  return dirs;
+}
 
-  for (const dir of dirs) {
+function readConfigMode(pluginName) {
+  for (const dir of configDirs(pluginName)) {
     try {
       const cfg = JSON.parse(fs.readFileSync(path.join(dir, 'config.json'), 'utf8'));
       const mode = sanitizeMode(cfg && cfg.defaultMode);
@@ -912,18 +1075,21 @@ function ledgerPath() {
 function accumulateTranscript(rec, transcriptPath) {
   if (!rec || typeof transcriptPath !== 'string' || !transcriptPath) return null;
 
-  let size;
+  let size, mtimeMs;
   try {
     const st = fs.statSync(transcriptPath, { throwIfNoEntry: false });
     if (!st || !st.isFile()) return null;
     size = st.size;
+    mtimeMs = st.mtimeMs;
   } catch {
     return null;
   }
 
   // A shrunk file means it was replaced or rewritten (session fork, resume,
   // manual edit). Anything we accumulated no longer describes it.
+  let catchup = false;
   if (rec.tPath !== transcriptPath || num(rec.tOff) === null || rec.tOff > size) {
+    catchup = true;
     rec.tPath = transcriptPath;
     rec.tOff = 0;
     rec.tId = '';
@@ -932,6 +1098,10 @@ function accumulateTranscript(rec, transcriptPath) {
     rec.tCc = 0;
     rec.tCr = 0;
     rec.tCtx = null;
+    rec.tApiTs = null;
+    rec.tStop = null;
+    rec.tReqTs = null;
+    rec.tPend = false;
   }
 
   if (size - rec.tOff > TRANSCRIPT_MAX_READ_BYTES) {
@@ -969,7 +1139,24 @@ function accumulateTranscript(rec, transcriptPath) {
       // Cheap pre-filter: most lines are user turns and tool results with no
       // usage block at all, and skipping JSON.parse on those is most of the
       // speed. Note the transcript writes `"usage"` unspaced.
-      if (!line || line.indexOf('"usage"') === -1) continue;
+      if (!line) continue;
+      if (line.indexOf('"usage"') === -1) {
+        // A user turn or a tool result. It carries no tokens, but its arrival
+        // AFTER the last response is the only evidence available that a request
+        // is in flight: the prompt is written to the transcript at submit time,
+        // while the response that answers it lands seconds or minutes later.
+        // Without this the bar spends the whole "thinking" window believing the
+        // previous turn is still the last thing that happened, and counts a
+        // cache down to zero that the in-flight request has already renewed.
+        //
+        // The two filters are disjoint -- no user record carries a `usage`
+        // block -- so this only ever inspects lines the first filter rejected.
+        if (line.indexOf('"type":"user"') !== -1) {
+          rec.tReqTs = catchup ? mtimeMs : Date.now();
+          rec.tPend = true;
+        }
+        continue;
+      }
 
       let o;
       try {
@@ -984,6 +1171,14 @@ function accumulateTranscript(rec, transcriptPath) {
       const id = o.message.id || o.requestId || '';
       if (id && id === rec.tId) continue;   // same response, streamed again
       rec.tId = id;
+      rec.tApiTs = catchup ? mtimeMs : Date.now();
+      // Why the stop reason is carried: "tool_use" means the assistant is
+      // going round again and another request -- another cache refresh --
+      // follows within seconds. Anything else ends the turn, and only then
+      // does the cache actually start ageing. The TTL clock reads this to
+      // decide whether it has something to count down.
+      rec.tStop = typeof o.message.stop_reason === 'string' ? o.message.stop_reason : null;
+      rec.tPend = false;
 
       const rIn = num(u.input_tokens) ?? 0;
       const rCc = num(u.cache_creation_input_tokens) ?? 0;
@@ -1014,6 +1209,11 @@ function tokenTotals(rec) {
     input: num(rec.tIn) ?? 0,
     cacheCreate: num(rec.tCc) ?? 0,
     cacheRead: num(rec.tCr) ?? 0,
+    // The cache is renewed by the REQUEST, not by the response that comes back
+    // from it, so the clock runs from whichever came last: a response we
+    // counted, or a prompt that has not been answered yet.
+    lastApi: Math.max(num(rec.tApiTs) ?? 0, num(rec.tReqTs) ?? 0) || null,
+    working: rec.tStop === 'tool_use' || rec.tPend === true,
   };
 }
 
@@ -1663,27 +1863,15 @@ function untilReset(resetsAt, nowSeconds) {
  * See the header block near the top for why the work is split this way.
  * ------------------------------------------------------------------------ */
 
-function usageCachePath() { return path.join(claudeDir(), USAGE_CACHE_FILE); }
+function usageCachePath() { return statePath(USAGE_CACHE_FILE); }
 
 /**
- * Is the feature switched on? One statSync, and the only cost when it is off.
- *
- * Memoised because two callers ask (the ledger pass and the refresh check) and
- * a flag file cannot change inside the lifetime of a single render.
+ * Is the feature switched on? Strictly `true`, never merely truthy: the state
+ * file is on disk where anything could have written it, and a request carrying
+ * the user's credential is not something a stray value gets to authorise.
  */
-let usageEnabledCache = null;
 function usageEnabled() {
-  if (usageEnabledCache !== null) return usageEnabledCache;
-  let on = false;
-  if (!USAGE_DISABLED) {
-    try {
-      on = fs.statSync(path.join(claudeDir(), USAGE_FLAG_FILE), { throwIfNoEntry: false }) !== undefined;
-    } catch {
-      on = false;
-    }
-  }
-  usageEnabledCache = on;
-  return on;
+  return !USAGE_DISABLED && readState().usage === true;
 }
 
 // Everything the child writes is already sanitised, but the cache is a file in
@@ -1700,18 +1888,8 @@ const USAGE_CACHE_MAX_BYTES = 64 * 1024;
  * anything but a missing field.
  */
 function readUsageSnapshot() {
-  try {
-    const file = usageCachePath();
-    // lstat, not stat: refuse a symlink, and refuse a file large enough to be
-    // something other than the ~400 bytes this cache actually is.
-    const st = fs.lstatSync(file, { throwIfNoEntry: false });
-    if (!st || !st.isFile() || st.isSymbolicLink() || st.size > USAGE_CACHE_MAX_BYTES) return null;
-    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
-    if (parsed && typeof parsed === 'object' && Array.isArray(parsed.limits)) return parsed;
-  } catch {
-    /* absent until the first successful refresh; corrupt means the same thing */
-  }
-  return null;
+  const parsed = readJsonWithLegacy(usageCachePath(), LEGACY_USAGE_CACHE, USAGE_CACHE_MAX_BYTES);
+  return parsed && Array.isArray(parsed.limits) ? parsed : null;
 }
 
 /** Is this snapshot recent enough to be presented as a measurement? */
@@ -1801,7 +1979,7 @@ function usageWorthRefreshing(d, t) {
 function maybeRefreshUsage(d, t) {
   try {
     if (!usageEnabled() || !usageWorthRefreshing(d, t)) return;
-    spawnDebounced(USAGE_CHECK_FILE, USAGE_TTL_MS, '--usage-refresh');
+    spawnDebounced(USAGE_JOB, USAGE_TTL_MS, '--usage-refresh');
   } catch {
     /* best effort, always */
   }
@@ -1988,15 +2166,212 @@ async function cacheUsageSnapshot() {
   const snap = normalizeUsage(await fetchUsage(token));
   if (!snap) return;   // a failed refresh leaves the previous snapshot in place
 
-  const file = usageCachePath();
-  const tmp = `${file}.${process.pid}.tmp`;
-  try {
-    fs.mkdirSync(path.dirname(file), { recursive: true });
-    fs.writeFileSync(tmp, JSON.stringify(snap), 'utf8');
-    fs.renameSync(tmp, file);   // atomic: a render can never read a half-written cache
-  } catch {
-    try { fs.unlinkSync(tmp); } catch { /* nothing else to do */ }
+  writeJsonFile(usageCachePath(), snap);
+}
+
+/* ---------------------------------------------------------------------------
+ * RTK savings badge
+ * ----------------------------------------------------------------------------
+ * RTK (Rust Token Killer) proxies dev commands through filters and records how
+ * many tokens each filtered command saved. Unlike caveman and ponytail there is
+ * no mode to read: the only source of the figure is `rtk gain`, and that is a
+ * process spawn costing ~50ms -- an order of magnitude more than the whole
+ * render budget, and unaffordable on the hot path.
+ *
+ * So this borrows the usage endpoint's split. A detached child runs the command
+ * and writes a cache; the render only ever reads that cache, and draws nothing
+ * at all until the first measurement lands.
+ *
+ * The cache is keyed by project directory because the badge reports project
+ * scope (`gain -p`), and two sessions in two repos share one cache file. An
+ * entry from the wrong project is not a fallback -- it is a wrong number with a
+ * plausible shape -- so a miss draws no badge.
+ * ------------------------------------------------------------------------ */
+
+const RTK_CACHE_FILE = 'rtk.json';
+const LEGACY_RTK_CACHE = '.statusline-rtk.json';
+const RTK_JOB = 'rtk';
+
+// How often a project's figure is re-measured. RTK's numbers only move when a
+// filtered command runs, so this tracks the pace of work, not of rendering.
+const RTK_TTL_MS = 60 * 1000;
+
+// Past this age the badge disappears rather than present a stale count as
+// current. Long enough to survive a session sitting idle over lunch.
+const RTK_MAX_AGE_MS = 30 * 60 * 1000;
+
+const RTK_TIMEOUT_MS = 5000;
+const RTK_CACHE_MAX_BYTES = 64 * 1024;
+
+// One entry per project directory ever visited would grow without bound on a
+// machine with many repos. Least recently measured is evicted first.
+const RTK_MAX_ENTRIES = 16;
+
+const RTK_DISABLED = process.env.CC_STATUSLINE_NORTK === '1';
+
+/**
+ * Is RTK installed at all?
+ *
+ * Only the refresh side asks. The config file is the cheapest available proof
+ * -- one statSync against a path RTK writes on first run -- and it is what
+ * keeps a machine without RTK from spawning a doomed child once a minute for
+ * the rest of time.
+ *
+ * Memoised: a package cannot install itself inside one render.
+ */
+let rtkInstalledCache = null;
+function rtkInstalled() {
+  if (rtkInstalledCache !== null) return rtkInstalledCache;
+  let found = false;
+  if (!RTK_DISABLED) {
+    for (const dir of configDirs('rtk')) {
+      try {
+        if (fs.statSync(path.join(dir, 'config.toml'), { throwIfNoEntry: false })) {
+          found = true;
+          break;
+        }
+      } catch {
+        /* unreadable is indistinguishable from absent, and means the same */
+      }
+    }
   }
+  rtkInstalledCache = found;
+  return found;
+}
+
+function rtkCachePath() { return statePath(RTK_CACHE_FILE); }
+
+/**
+ * The whole cache -- `{ [projectDir]: { at, pct, saved } }` -- or `{}`.
+ *
+ * Memoised because both the badge and the refresh gate want it within a single
+ * render, and neither can change it. The detached child reads it exactly once,
+ * in a fresh process, so the memo cannot serve it a stale copy.
+ */
+let rtkCacheMemo = null;
+function readRtkCache() {
+  if (rtkCacheMemo === null) {
+    rtkCacheMemo = readJsonWithLegacy(rtkCachePath(), LEGACY_RTK_CACHE, RTK_CACHE_MAX_BYTES) || {};
+  }
+  return rtkCacheMemo;
+}
+
+/**
+ * This project's last measurement, or null when there is none, it is stale, or
+ * it fails validation. Every field is re-checked here rather than trusted: the
+ * numbers come out of a file in a shared config directory and go into a
+ * terminal, and a percentage is only meaningful inside 0..100 anyway.
+ */
+function readRtkEntry(dir, nowMs) {
+  if (RTK_DISABLED || !dir) return null;
+  const e = readRtkCache()[dir];
+  const at = num(e && e.at);
+  // A stamp from the future is a clock that stepped, not a fresh measurement.
+  if (at === null || nowMs - at < 0 || nowMs - at > RTK_MAX_AGE_MS) return null;
+  const pct = num(e.pct);
+  const saved = num(e.saved);
+  if (pct === null || saved === null || saved < 0) return null;
+  return { pct: clamp(pct, 0, 100), saved };
+}
+
+/** 512 -> "512", 35516 -> "36K", 1284000 -> "1.3M". Badge-sized, not exact. */
+function compactCount(n) {
+  const v = Math.max(0, Math.round(num(n) ?? 0));
+  if (v < 1000) return String(v);
+  if (v < 1000000) return Math.round(v / 1000) + 'K';
+  const m = v / 1000000;
+  return (m < 10 ? m.toFixed(1) : String(Math.round(m))) + 'M';
+}
+
+/**
+ * "[RTK:17%|36K]" -- the share of tokens this project's filtered commands
+ * saved, and the absolute count behind it. Empty string when nothing has been
+ * measured for this project, which is also what an uninstalled RTK looks like.
+ */
+function rtkBadge(d, nowMs) {
+  const e = readRtkEntry(gitCwd(d), nowMs);
+  return e ? '[RTK:' + Math.round(e.pct) + '%|' + compactCount(e.saved) + ']' : '';
+}
+
+/**
+ * Is a measurement worth spawning for, for THIS project?
+ *
+ * The debounce marker inside spawnDebounced is global, so on its own it would
+ * let one busy project starve another of refreshes a minute at a time. This
+ * gate asks the narrower question first, and a project whose entry is still
+ * fresh never competes for the marker at all.
+ */
+function rtkWorthRefreshing(dir, nowMs) {
+  if (!dir || !rtkInstalled()) return false;
+  const at = num(readRtkCache()[dir]?.at);
+  return at === null || nowMs - at < 0 || nowMs - at >= RTK_TTL_MS;
+}
+
+/**
+ * Kick off a detached measurement if this project's figure has aged out.
+ *
+ * Called only AFTER stdout has been written. Never throws: a status bar that
+ * failed because a savings figure could not be refreshed would be strictly
+ * worse than one drawing no badge.
+ */
+function maybeRefreshRtk(d) {
+  try {
+    const dir = gitCwd(d);
+    if (!rtkWorthRefreshing(dir, Date.now())) return;
+    spawnDebounced(RTK_JOB, RTK_TTL_MS, '--rtk-refresh', dir);
+  } catch {
+    /* best effort, always */
+  }
+}
+
+/**
+ * Detached half: measure this project and merge the result into the cache.
+ *
+ * Runs with cwd already set to the project directory by spawnDebounced, which
+ * is what makes `-p` scope the answer to the right repo. Every failure mode --
+ * RTK missing, a locked database, a schema change, a half-written file --
+ * leaves the previous measurement exactly where it was.
+ *
+ * Prints nothing, and its exit code is discarded.
+ */
+function cacheRtkGain() {
+  if (!rtkInstalled()) return;
+  const dir = process.cwd();
+
+  let res;
+  try {
+    res = require('child_process').spawnSync('rtk', ['gain', '-p', '-f', 'json'], {
+      cwd: dir,
+      encoding: 'utf8',
+      timeout: RTK_TIMEOUT_MS,
+      windowsHide: true,
+      maxBuffer: 1024 * 1024,
+    });
+  } catch {
+    return;   // not on PATH, or not executable
+  }
+  if (!res || res.error || res.status !== 0 || typeof res.stdout !== 'string') return;
+
+  let summary;
+  try {
+    summary = JSON.parse(res.stdout).summary;
+  } catch {
+    return;   // text output from an older RTK, or a truncated read
+  }
+  const pct = num(summary?.avg_savings_pct);
+  const saved = num(summary?.total_saved);
+  if (pct === null || saved === null) return;
+
+  const cache = readRtkCache();
+  cache[dir] = { at: Date.now(), pct: clamp(pct, 0, 100), saved: Math.max(0, Math.round(saved)) };
+
+  const keys = Object.keys(cache);
+  if (keys.length > RTK_MAX_ENTRIES) {
+    keys.sort((a, b) => (num(cache[b]?.at) ?? 0) - (num(cache[a]?.at) ?? 0));
+    for (const k of keys.slice(RTK_MAX_ENTRIES)) delete cache[k];
+  }
+
+  writeJsonFile(rtkCachePath(), cache);
 }
 
 /* ---------------------------------------------------------------------------
@@ -2016,11 +2391,15 @@ function formatEffort(level) {
 
 /**
  * Line 1: Model (context variant) Effort Thinking [FAST] [CAVEMAN:X]
- *         [PONYTAIL:Y] session-name
+ *         [PONYTAIL:Y] [RTK:P%|N] session-name
  *
  * The required elements keep their specified relative order. FAST sits with the
  * other mode flags; the session name is appended last because it is the longest
  * and the first thing worth losing on a narrow terminal.
+ *
+ * RTK is last of the tags and drops first of them: it is the widest, and it is
+ * the only one reporting a measurement rather than a mode, so losing it costs
+ * no information about how the session is configured.
  */
 function lineModel(d, maxWidth) {
   const model = d?.model?.display_name;
@@ -2035,6 +2414,7 @@ function lineModel(d, maxWidth) {
   // Tags are omitted entirely when inactive -- no empty brackets.
   const caveman = detectPlugin('caveman', 'CAVEMAN_DEFAULT_MODE');
   const ponytail = detectPlugin('ponytail', 'PONYTAIL_DEFAULT_MODE');
+  const rtk = rtkBadge(d, Date.now());
 
   // fast_mode changes throughput and therefore how fast the 5h window burns.
   // Strictly boolean-true: an absent field must not read as "off" styling.
@@ -2048,6 +2428,7 @@ function lineModel(d, maxWidth) {
     cell(fast ? yellow('[FAST]') : '', 3),
     cell(caveman ? orange(`[CAVEMAN:${caveman}]`) : '', 2),
     cell(ponytail ? sage(`[PONYTAIL:${ponytail}]`) : '', 2),
+    cell(rtk ? rust(rtk) : '', 6),
   ], ' ', maxWidth);
 }
 
@@ -2460,7 +2841,46 @@ function lineUsage(d, ledger, nowSeconds, maxWidth) {
   const hit = denom > 0 ? (cacheRead / denom) * 100 : 0;
   // Inverted scale: a HIGH cache hit rate is the good outcome.
   const hitColor = hit >= 80 ? green : hit >= 50 ? cyan : orange;
-  const cache = `${dim('Cache')} ${hitColor(`${Math.round(hit)}%`)}`;
+  // Seconds left on the 5-minute prompt cache, counted from the last API
+  // response this session wrote to its transcript. Null while no response has
+  // been seen -- a countdown with nothing to count down from would be a
+  // fabrication, and the cell falls back to the hit rate alone.
+  //
+  // Also null MID-TURN. Every request refreshes the cache, so while the
+  // assistant is looping through tool calls the clock is genuinely being reset
+  // every few seconds -- a countdown there is not wrong so much as useless: it
+  // reports a deadline that the next request, already in flight, will move. The
+  // number only means anything once nothing is running and the cache is really
+  // ageing, which is also the only moment the reader can act on it.
+  const lastApi = num(tok?.lastApi);
+  const live = lastApi === null ? null : 300 - Math.floor((Date.now() - lastApi) / 1000);
+  // Hidden while working, with one exception: a clock that has actually run
+  // out still shows. Suppression exists to hide a deadline the next request
+  // will move, and once the five minutes are gone there is nothing left to
+  // move -- a turn that stalls or is cancelled would otherwise hide a dead
+  // cache behind a "still working" state it never leaves.
+  const ttl = live !== null && (!tok?.working || live <= 0) ? live : null;
+  // Expired counts as red, not as its own tier: ttl <= 0 falls through both
+  // thresholds to red on its own.
+  const ttlColor = ttl === null ? dim : ttl > 120 ? green : ttl > 60 ? yellow : red;
+
+  // The LABEL carries the countdown colour, not the hit rate colour. The two
+  // numbers in this cell answer different questions -- the hit rate is a
+  // session-long trend, the TTL is a deadline -- and only the deadline is
+  // actionable right now. Colouring the word means the cell's urgency reads at
+  // a glance, from the leftmost glyph, without parsing either figure. The hit
+  // rate keeps its own inverted scale on its own number.
+  let cacheText = `${ttlColor('Cache')} ${hitColor(`${Math.round(hit)}%`)}`;
+  if (ttl !== null) {
+    const shown = Math.max(0, ttl);
+    const min = Math.floor(shown / 60);
+    const sec = String(shown % 60).padStart(2, '0');
+    // Appended the way every other multi-value cell appends -- a dim colon and
+    // no second label. 5h/7d and Bgt all read as one figure with qualifiers
+    // hung off it, and a lone "TTL" word in the middle of the line broke that
+    // rhythm. The coloured label already says which clock this is.
+    cacheText += dim(':') + ttlColor(`${min}:${sec}`);
+  }
 
   // LngCtx: progress toward the FIXED 200k long-context threshold, which is
   // fixed regardless of the actual window size. On a 1M model it is reached at
@@ -2541,7 +2961,7 @@ function lineUsage(d, ledger, nowSeconds, maxWidth) {
   return fit([
     cell(ctx, 0),
     cell(tokens, 4),
-    cell(cache, 3),
+    cell(cacheText, 3),
     cell(showLong ? longCtx : '', 2),
     ...constraint,
     // Rank 2, placed LAST on the line. Being rightmost means the equal-rank
@@ -2553,16 +2973,16 @@ function lineUsage(d, ledger, nowSeconds, maxWidth) {
 /* ---------------------------------------------------------------------------
  * Optional self-update
  * ----------------------------------------------------------------------------
- * OFF unless <config>/.statusline-autoupdate exists. `install.js --auto-update`
- * creates it; `install.js --no-auto-update` removes it. When it is absent the
- * entire feature costs one statSync per render.
+ * OFF unless `autoUpdate` is set in <config>/statusline/state.json.
+ * `install.js --auto-update` sets it; `--no-auto-update` clears it. When it is
+ * off the entire feature costs one field lookup on state already read.
  *
  * When it is present the render path still does no network I/O. It checks the
  * age of a marker file and, at most once a day, spawns a DETACHED child that
  * exits on its own schedule -- the bar is already printed by then.
  *
  * The child refuses to install anything that is not, in order:
- *   1. present in the manifest written at install time,
+ *   1. present in the file hashes recorded at install time,
  *   2. byte-identical to what that install put on disk (else you edited it --
  *      the tunables at the top of this file are meant to be edited, and an
  *      updater that silently reverts them would be a bug, not a feature),
@@ -2573,9 +2993,7 @@ function lineUsage(d, ledger, nowSeconds, maxWidth) {
 
 const UPDATE_REPO = 'GridFlowTech/claude-statusline';
 const UPDATE_FILES = ['statusline.js', 'subagent-statusline.js'];
-const UPDATE_FLAG_FILE = '.statusline-autoupdate';
-const UPDATE_MARKER_FILE = '.statusline-last-update';
-const UPDATE_MANIFEST_FILE = '.statusline-manifest.json';
+const UPDATE_JOB = 'update';
 const UPDATE_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const UPDATE_MIN_BYTES = 4096;
 // Ceiling on any single download. Both scripts are ~40 KB; a response in the
@@ -2588,8 +3006,8 @@ const UPDATE_MAX_BYTES = 5 * 1024 * 1024;
  */
 function maybeSelfUpdate() {
   try {
-    if (!fs.statSync(path.join(claudeDir(), UPDATE_FLAG_FILE), { throwIfNoEntry: false })) return;
-    spawnDebounced(UPDATE_MARKER_FILE, UPDATE_INTERVAL_MS, '--self-update');
+    if (readState().autoUpdate !== true) return;
+    spawnDebounced(UPDATE_JOB, UPDATE_INTERVAL_MS, '--self-update');
   } catch {
     // An updater that can blank the status bar is worse than a stale statusline.
   }
@@ -2643,28 +3061,24 @@ async function installUpdate() {
   const { spawnSync } = require('child_process');
 
   const dir = claudeDir();
-  const manifestPath = path.join(dir, UPDATE_MANIFEST_FILE);
   const sha = (text) => crypto.createHash('sha256').update(text, 'utf8').digest('hex');
 
-  let manifest;
-  try {
-    manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-  } catch {
-    return;                       // no manifest -> no baseline -> no update
-  }
-  if (!manifest || typeof manifest !== 'object' || !manifest.files) return;
+  // readState() falls back to the old manifest, so an install that has not been
+  // re-run since the layout changed still has a baseline to compare against.
+  const state = readState();
+  if (!state.files || typeof state.files !== 'object') return;   // no baseline -> no update
 
   // "owner/name" shape only: the value is interpolated into a URL path, and a
-  // manifest written by anything else must not point the fetch elsewhere.
-  const repo = typeof manifest.repo === 'string' && /^[\w.-]+\/[\w.-]+$/.test(manifest.repo)
-    ? manifest.repo
+  // state file written by anything else must not point the fetch elsewhere.
+  const repo = typeof state.repo === 'string' && /^[\w.-]+\/[\w.-]+$/.test(state.repo)
+    ? state.repo
     : UPDATE_REPO;
-  const ref = typeof manifest.ref === 'string' && manifest.ref ? manifest.ref : 'main';
+  const ref = typeof state.ref === 'string' && state.ref ? state.ref : 'main';
   let changed = false;
 
   for (const name of UPDATE_FILES) {
     const dest = path.join(dir, name);
-    const baseline = manifest.files[name];
+    const baseline = state.files[name];
     if (typeof baseline !== 'string') continue;      // not installed by us
 
     let current;
@@ -2687,7 +3101,7 @@ async function installUpdate() {
       const res = spawnSync(process.execPath, ['--check', tmp], { windowsHide: true });
       if (res.status !== 0) { fs.unlinkSync(tmp); continue; }
       fs.renameSync(tmp, dest);                      // atomic; a half-written
-      manifest.files[name] = nextHash;               // statusline is impossible
+      state.files[name] = nextHash;                  // statusline is impossible
       changed = true;
     } catch {
       try { fs.unlinkSync(tmp); } catch { /* best effort */ }
@@ -2695,12 +3109,11 @@ async function installUpdate() {
   }
 
   if (!changed) return;
-  try {
-    manifest.updatedAt = new Date().toISOString();
-    const tmp = `${manifestPath}.tmp.${process.pid}`;
-    fs.writeFileSync(tmp, JSON.stringify(manifest, null, 2) + '\n');
-    fs.renameSync(tmp, manifestPath);
-  } catch { /* the file is updated; a stale manifest only costs one no-op pass */ }
+  // Written to the NEW path even when the baseline came from the old manifest:
+  // an install that self-updates before install.js is re-run migrates itself,
+  // and readState() prefers the new file from then on.
+  state.updatedAt = new Date().toISOString();
+  writeJsonFile(statePath(STATE_FILE), state);   // a stale one costs a no-op pass
 }
 
 /* ---------------------------------------------------------------------------
@@ -2765,6 +3178,7 @@ function main() {
   // Strictly after the write, so nothing here can delay a single frame.
   maybeSelfUpdate();
   maybeRefreshUsage(data, ledger);
+  maybeRefreshRtk(data);
 }
 
 // The flag strings are an INTERFACE, not an implementation detail: an already
@@ -2779,6 +3193,10 @@ if (process.argv.includes('--self-update')) {
   // Detached child spawned by maybeRefreshUsage(). Same contract: no stdin, no
   // stdout, exit code discarded.
   cacheUsageSnapshot().catch(() => {});
+} else if (process.argv.includes('--rtk-refresh')) {
+  // Detached child spawned by maybeRefreshRtk(), started in the project
+  // directory it is measuring. Same contract: no stdin, no stdout.
+  cacheRtkGain();
 } else {
   try {
     main();

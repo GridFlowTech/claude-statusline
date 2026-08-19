@@ -9,7 +9,7 @@ in four lines. Runs on Windows, macOS and Linux from the same files.
 |           |                                                                                                                                            |
 | --------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
 | Install   | One piped command - see [Installation](#installation)                                                                                      |
-| Scripts   | `~/.claude/statusline.js` (2124 lines) · `~/.claude/subagent-statusline.js` (336 lines)                                                    |
+| Scripts   | `~/.claude/statusline.js` (3095 lines) · `~/.claude/subagent-statusline.js` (390 lines)                                                    |
 | Ledger    | `~/.claude/cost_ledger.json` (created on first run)                                                                                        |
 | Config    | `statusLine` and `subagentStatusLine` blocks in `~/.claude/settings.json`                                                                  |
 | Runtime   | Node.js ≥ 14.17 - built-ins only (`fs`, `path`, `os`, `child_process`; `https`/`crypto` lazily, in the optional updater). No dependencies. |
@@ -129,7 +129,7 @@ gets a fix. And the runtime is free: Node is already a hard requirement.
 --no-usage          turn the usage endpoint back off and delete its cache
 --main-only         install the status line, not the subagent panel
 --subagent-only     install the subagent panel, not the status line
---interval <sec>    statusLine refreshInterval (default 30)
+--interval <sec>    statusLine refreshInterval (default 1)
 --ref <branch|tag>  install from a specific ref (default main)
 --dir <path>        target config dir (default $CLAUDE_CONFIG_DIR or ~/.claude)
 --local | --remote  force copying from this checkout, or downloading
@@ -156,13 +156,15 @@ either without the other. See
 | `<config>/subagent-statusline.js`    | the subagent panel, same                                            |
 | `<config>/settings.json`             | `statusLine` + `subagentStatusLine` keys; every other key preserved |
 | `<config>/settings.json.bak`         | copy of your settings taken before the write                        |
-| `<config>/.statusline-manifest.json` | sha256 of what was installed, for the update edit-check             |
-| `<config>/.statusline-autoupdate`    | flag file, only with `--auto-update`                                |
-| `<config>/.statusline-usage`         | flag file, only with `--usage`                                      |
+| `<config>/statusline/state.json`     | sha256 of what was installed (for the update edit-check) plus the `--auto-update` and `--usage` opt-ins |
 
 `<config>` is `$CLAUDE_CONFIG_DIR` if set, else `~/.claude`. Nothing outside it
 is ever touched, and `cost_ledger.json` is never written or deleted by the
 installer.
+
+Installing also **migrates** the old layout - eight `.statusline-*` dotfiles at
+the top of `<config>` - into `<config>/statusline/`, and deletes what is left.
+See [State on disk](#state-on-disk).
 
 Nothing is installed until **every** file has been fetched _and_ has passed
 `node --check`. A truncated transfer, a captive-portal login page or a 404 body
@@ -203,7 +205,7 @@ Still two files and one key, if you would rather. Copy `statusline.js` and
   "statusLine": {
     "type": "command",
     "command": "node \"~/.claude/statusline.js\"",
-    "refreshInterval": 30
+    "refreshInterval": 1
   },
   "subagentStatusLine": {
     "type": "command",
@@ -229,10 +231,11 @@ curl -fsSL https://raw.githubusercontent.com/GridFlowTech/claude-statusline/main
 irm https://raw.githubusercontent.com/GridFlowTech/claude-statusline/main/install.js | node - --uninstall
 ```
 
-It removes both settings keys, both scripts, and the manifest, flag and marker
-files for [auto-update](#auto-update) and the [usage endpoint](#usage-endpoint) -
-including the cached usage snapshot - backing `settings.json` up first and
-leaving every other key alone.
+It removes both settings keys, both scripts, and everything in
+`<config>/statusline/` - the install record, both opt-ins, the job stamps and
+both caches - along with the [old `.statusline-*` layout](#state-on-disk) if any
+of it is still there. `settings.json` is backed up first and every other key is
+left alone.
 
 **`cost_ledger.json` is kept.** It is your cost history, not part of the
 install, and a reinstall picks up exactly where you left off. Add `--purge` to
@@ -258,9 +261,10 @@ Off by default because the honest description of the feature is _this machine
 runs code downloaded from GitHub on a schedule, without asking_. That is a
 reasonable trade for a statusline you want to keep current, and a bad default to
 impose on someone who did not ask for it. `--no-auto-update` turns it back off;
-so does deleting `~/.claude/.statusline-autoupdate`.
+so does setting `autoUpdate` to `false` in `~/.claude/statusline/state.json`.
 
-When it is off, the whole feature costs one `statSync` per render.
+When it is off, the whole feature costs one field lookup on state the render
+has already read.
 
 When it is on, the render path still does no network I/O. It checks the age of a
 marker file and, at most once a day, spawns a **detached** child that outlives
@@ -290,9 +294,21 @@ installer. It is the same command as a fresh install.
 
 Statusline updates are event-driven, and the events go quiet exactly when you
 want the bar most - while background subagents run and the main session sits
-idle. `refreshInterval: 30` re-runs the command every 30 s so rate-limit
-percentages, projected-exhaustion times, and time-until-reset stay current.
-Minimum is `1`; omit the field for event-only updates.
+idle. `refreshInterval: 1` re-runs the command every second so rate-limit
+percentages, projected-exhaustion times, time-until-reset, and the
+[cache TTL countdown](#cache-ttl) stay current. Minimum is `1`; omit the
+field for event-only updates.
+
+One second is the default because the TTL clock is the one cell that is wrong
+the moment it stops moving - a countdown frozen at `1:12` reads as 72 seconds
+of headroom that may already be gone. Every other cell tolerates a coarser
+sample. The cost is a Node process per second per session. Measured on Windows 11
+against a warm ledger and a 150k-token transcript, one render takes ~120 ms
+wall - most of it Node startup, not the script - so a single open session
+costs on the order of a tenth of one core, and nothing at all when no session
+is open. Linux and macOS start Node faster and land lower. If that trade is
+wrong for you, `--interval 10` cuts it by 90% and the TTL steps in 10 s jumps
+instead of ticking.
 
 ### Verify
 
@@ -324,7 +340,7 @@ all is dropped rather than printed blank.
 ### Line 1 - identity and modes
 
 ```text
-Opus 5 (1M context) XHigh Thinking [FAST] [CAVEMAN:ULTRA] [PONYTAIL:ULTRA]
+Opus 5 (1M context) XHigh Thinking [FAST] [CAVEMAN:ULTRA] [PONYTAIL:ULTRA] [RTK:18%|37K]
 ```
 
 | Cell           | Source                                          | Notes                                                                                                                                                                            |
@@ -336,11 +352,12 @@ Opus 5 (1M context) XHigh Thinking [FAST] [CAVEMAN:ULTRA] [PONYTAIL:ULTRA]
 | `[FAST]`       | `fast_mode === true`                            | Fast mode changes throughput and therefore rate-limit burn.                                                                                                                      |
 | `[CAVEMAN:x]`  | plugin state                                    | See [Plugin mode detection](#plugin-mode-detection).                                                                                                                             |
 | `[PONYTAIL:x]` | plugin state                                    |                                                                                                                                                                                  |
+| `[RTK:p%\|n]`   | `rtk gain -p`, cached                           | Share of tokens this project's filtered commands saved, and the count behind it. See [RTK savings badge](#rtk-savings-badge). Widest tag, so it is the first one a narrow terminal drops. |
 
 ### Line 2 - runway
 
 ```text
-Ctx 15% · In 152,002 Out 153,470 · Cache 98% · LngCtx 76% · 5h 90%:20%↑ 02:41:4h · 7d 52%:50%→ 08:06:3d
+Ctx 15% · In 152,002 Out 153,470 · Cache 98%:4:12 · LngCtx 76% · 5h 90%:20%↑ 02:41:4h · 7d 52%:50%→ 08:06:3d
 ```
 
 | Cell        | Source                              | Notes                                                                  |
@@ -348,7 +365,7 @@ Ctx 15% · In 152,002 Out 153,470 · Cache 98% · LngCtx 76% · 5h 90%:20%↑ 02
 | `Ctx n%`    | `context_window.used_percentage`    | Coloured by the token count behind the percentage, on a five-tier degradation scale - see [Ctx](#ctx). `0%` before the first response, `↺` in the gap after `/compact`. |
 | `In`        | `context_window.total_input_tokens` | Tokens currently in the window. `↺` while the post-`/compact` size is unknown. |
 | `Out`       | **transcript**                      | Session-cumulative output. Not available from the payload - see below. |
-| `Cache n%`  | **transcript**                      | Session-cumulative hit rate. Inverted colour scale - high is good.     |
+| `Cache n%:m:ss` | **transcript**                  | Session-cumulative hit rate, then seconds left on the 5-minute prompt cache. The clock shows only between turns. Inverted colour scale on the rate - high is good. See [Cache TTL](#cache-ttl). |
 | `LngCtx n%` | computed, `exceeds_200k_tokens`     | Progress toward the fixed 200k threshold. Extended windows only.       |
 | `5h`        | `rate_limits.five_hour`             | Threshold-coloured. Subscription plans only.                           |
 | `7d`        | `rate_limits.seven_day`             | Subscription plans only.                                               |
@@ -367,7 +384,7 @@ deployment the windows are replaced by the budget gauge and the blended token
 rate rather than sitting there reading `n/a` forever:
 
 ```text
-Ctx 76% · In 152,002 Out 153,470 · Cache 98% · Bgt $24.36/250:11h · $/Mtok 12.83
+Ctx 76% · In 152,002 Out 153,470 · Cache 98%:4:12 · Bgt $24.36/250:11h · $/Mtok 12.83
 ```
 
 That one is a 200k model, which is also why `LngCtx` is absent - see
@@ -377,7 +394,7 @@ That one is a 200k model, which is also why `LngCtx` is absent - see
 three limit gauges read left to right as one group:
 
 ```text
-Ctx 15% · In 152,002 Out 878 · Cache 92% · 5h 6%:34%↓:3h · 7d 41%:50%↓:3d · Fable 82%
+Ctx 15% · In 152,002 Out 878 · Cache 92%:2:41 · 5h 6%:34%↓:3h · 7d 41%:50%↓:3d · Fable 82%
 ```
 
 ### Line 3 - money
@@ -793,6 +810,89 @@ Falls back to `current_usage` (i.e. the last call) when the transcript is
 unreadable. Denominator zero - or any field nullish - yields `0%`. Colours
 invert the usual scale: green ≥ 80, cyan ≥ 50, orange below.
 
+### Cache TTL
+
+```text
+Cache 92%:2:41
+          ^^^^  seconds left on the 5-minute prompt cache
+```
+
+Anthropic's prompt cache holds a prefix for five minutes, and every request
+that hits it restarts the clock. Let it lapse and the next turn re-writes the
+whole prefix at cache-creation rates instead of reading it at a tenth of them -
+on a 150k-token context that is the difference between a cent and a dime, paid
+silently. The countdown says how long the cheap path is still open.
+
+**The clock only runs between turns.** Every request refreshes the cache, so
+while the assistant is looping through tool calls the five minutes really is
+being reset every few seconds - a countdown there reports a deadline that the
+request already in flight will move. Mid-turn the cell drops back to the hit
+rate alone:
+
+```text
+Cache 98%           assistant is working - another request is coming
+Cache 98%:3:25      turn finished - the cache is now actually ageing
+```
+
+Two transcript facts decide the state, because a response is not the only
+thing that renews a cache - the *request* is:
+
+| Newest record | Meaning | Clock |
+| --- | --- | --- |
+| assistant, `stop_reason: tool_use` | another request follows | hidden |
+| user turn or tool result | a request is in flight, unanswered | hidden |
+| assistant, any other `stop_reason` | the turn is over | runs |
+
+The second row matters more than it looks. A prompt is written to the
+transcript the moment it is submitted, but the response answering it lands
+seconds or minutes later. Reading `stop_reason` alone, the bar spends that
+whole thinking window believing the *previous* turn is still the last thing
+that happened - so it keeps counting down a cache the in-flight request has
+already renewed, and can reach `0:00` while the assistant is visibly working.
+
+The clock therefore runs from whichever came last: a response that was
+counted, or a prompt that has not been answered yet.
+
+One exception overrides the hiding. A clock that has genuinely run out still
+shows, even mid-turn. Suppression exists to hide a deadline the next request
+will move, and past five minutes there is nothing left to move - without the
+exception a stalled or cancelled turn would hide a dead cache behind a
+"still working" state it never leaves.
+
+The zero point is the last API response the session wrote to its transcript,
+not the last render. Two clocks feed it:
+
+| Situation | Stamp used |
+| --- | --- |
+| Tailing a transcript already being followed | `Date.now()` when the response is parsed - within one refresh of the real thing |
+| First read of a transcript, or after a fork/resume/rewrite resets the offset | the transcript file's **mtime** |
+
+The second row is what keeps a resumed session honest. Re-reading an hour-old
+transcript from byte zero parses hundreds of responses in one pass, and
+stamping them with the wall clock would open the bar on a confident `5:00`
+over a cache that went cold before lunch. The file's own mtime is when the
+last response was actually written, so the countdown starts wherever it truly
+is - usually already expired.
+
+Colours are a plain deadline scale, and the word `Cache` takes the same colour
+as the number so the cell reads at a glance from its leftmost glyph:
+
+| Remaining | Colour |
+| --- | --- |
+| > 2:00 | green |
+| 1:01 - 2:00 | yellow |
+| <= 1:00 | red |
+| expired | red `0:00` |
+
+Expired pins at `0:00` rather than counting negative. The cell falls back to
+the hit rate alone - no colon, no clock - until the session has written its
+first response, because a countdown with no zero point would be a fabrication.
+
+Two caveats. The 300-second window is a constant: sessions on the 1-hour cache
+TTL will watch this expire at `0:00` while their cache stays warm for another
+55 minutes. And the clock only advances when the bar redraws, so it is only as
+smooth as [`refreshInterval`](#refreshinterval).
+
 Note the denominator differs from implementations using
 `read / (read + creation)`. That form omits fresh input and so overstates the
 hit rate.
@@ -1092,9 +1192,9 @@ The token is read, used once, and never stored, logged, or written to the cache.
 
 | Path | |
 |------|--|
-| `<config>/.statusline-usage` | flag file; the feature is off without it |
-| `<config>/.statusline-usage.json` | the cached snapshot, ~300 bytes |
-| `<config>/.statusline-usage-check` | refresh debounce marker |
+| `<config>/statusline/state.json` | `usage: true` opts in; the feature is off without it |
+| `<config>/statusline/usage.json` | the cached snapshot, ~300 bytes |
+| `<config>/statusline/jobs.json` | `usage` stamp, the refresh debounce |
 
 | Variable | Default | |
 |----------|---------|--|
@@ -1283,6 +1383,110 @@ it.
 
 ---
 
+## RTK savings badge
+
+RTK (Rust Token Killer) proxies dev commands through filters and records how
+many tokens each filtered command saved:
+
+```text
+[RTK:18%|37K]
+```
+
+The share is `avg_savings_pct` for the current project, the count is
+`total_saved` behind it.
+
+Detection cannot work like the plugins do. There is no mode file to read - the
+only source of the figure is `rtk gain`, and that is a process spawn costing
+~50 ms, an order of magnitude more than the entire render budget. So the badge
+borrows the [usage endpoint](#usage-endpoint)'s split:
+
+- **Render path** - reads `~/.claude/statusline/rtk.json` and nothing else.
+- **Detached child** - `statusline.js --rtk-refresh`, spawned _after_ stdout is
+  written, runs `rtk gain -p -f json` and rewrites that cache.
+
+| File                             | Contents                                     |
+| -------------------------------- | -------------------------------------------- |
+| `<config>/statusline/rtk.json`  | `{ [projectDir]: { at, pct, saved } }`, capped at 16 projects |
+| `<config>/statusline/jobs.json` | `rtk` stamp, the refresh debounce            |
+
+Both are removed by `install.js --uninstall`.
+
+Consequences worth knowing:
+
+| Behaviour                                       | Why                                                                                                                                   |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------- |
+| Nothing shows on the first render after install | There is no measurement yet. The badge appears on the next render, ~60 s later at the default refresh interval.                       |
+| Keyed by project directory                      | The figure is project-scoped (`gain -p`) and two sessions in two repos share one cache file. An entry from another project is a wrong number with a plausible shape, so a miss draws no badge. |
+| Refreshed at most once a minute, per project    | RTK's numbers only move when a filtered command runs. The per-project gate is checked before the global debounce marker, so a busy repo cannot starve a quiet one. |
+| Disappears after 30 minutes without a refresh   | A stale count presented as current is worse than no count. `RTK_MAX_AGE_MS`.                                                          |
+| At most 16 projects cached                      | One entry per directory ever visited would grow without bound. Least recently measured is evicted. `RTK_MAX_ENTRIES`.                 |
+
+RTK is detected by its `config.toml`, searched in `$XDG_CONFIG_HOME/rtk/`, then
+`%APPDATA%\rtk\`, then `~/.config/rtk/` - the same locations the plugin readers
+search. Without it no child is ever spawned. `CC_STATUSLINE_NORTK=1` turns the
+whole thing off, badge and measurement alike.
+
+---
+
+## State on disk
+
+Everything the status line keeps lives in `<config>/statusline/`, one file per
+**writer** rather than one per fact:
+
+| File         | Written by                         | Contents                                                     |
+| ------------ | ---------------------------------- | ------------------------------------------------------------ |
+| `state.json` | `install.js`, and the update child | install hashes, `repo`/`ref`, `autoUpdate`, `usage`          |
+| `jobs.json`  | the render process                 | epoch-ms stamp per background job: `update`, `usage`, `rtk`  |
+| `usage.json` | the `--usage-refresh` child        | the cached rate-limit snapshot                               |
+| `rtk.json`   | the `--rtk-refresh` child          | the cached savings figure, per project                       |
+
+`cost_ledger.json` stays where it is, at the top of `<config>`: it is your cost
+history rather than our state, `--uninstall` keeps it, and only `--purge`
+deletes it.
+
+### Why grouped by writer
+
+Because that is what makes merging safe. No two processes ever
+read-modify-write the same file, so no snapshot can be clobbered by an
+unrelated update, and every write still lands atomically through tmp+rename.
+The two caches stay apart for exactly this reason - they are written by two
+different detached children, on independent cadences.
+
+The three job stamps share `jobs.json` because only the render process ever
+writes them. Two concurrent renders racing there cost at most one extra spawn,
+which is what a debounce is allowed to get wrong.
+
+Merging is not a performance measure and does not pretend to be. Measured on a
+warm Windows box, a cache read costs 45µs against a ~35 ms node startup:
+
+```text
+usage.json        0.3K  read+parse 0.045ms
+rtk.json          0.2K  read+parse 0.045ms
+cost_ledger.json 48.1K  read+parse 0.344ms
+statSync a flag                    0.013ms
+```
+
+### Upgrading from the old layout
+
+Before this, the same state was eight dotfiles directly under `<config>`:
+`.statusline-manifest.json`, `.statusline-autoupdate`, `.statusline-usage`,
+`.statusline-usage.json`, `.statusline-usage-check`, `.statusline-rtk.json`,
+`.statusline-rtk-check` and `.statusline-last-update`.
+
+Nothing needs doing:
+
+- **Every reader falls back** to its old path when the new file is absent, so a
+  `statusline.js` that self-updated before `install.js` was re-run keeps its
+  opt-ins and its cached figures. Once the new file exists the fallback is never
+  consulted again, so the transition costs nothing in the steady state.
+- **The installer migrates** on its next run: the two caches move, the rest is
+  deleted. The three job stamps are not carried over - losing them costs one
+  early run of each background job.
+- **`--uninstall` removes both layouts**, and the `statusline/` directory itself
+  when nothing else is left in it.
+
+---
+
 ## Configuration
 
 ### Constants (top of `statusline.js`)
@@ -1296,6 +1500,9 @@ it.
 | `PACE_SLOW_PROJECTED`       | `85`    | Projected % below which the arrow turns green.                                |
 | `GIT_TIMEOUT_MS`            | `800`   | Hard kill for a hung `git status`.                                            |
 | `FETCH_DEBOUNCE_SECONDS`    | `600`   | Minimum gap between background fetches, per branch.                           |
+| `RTK_TTL_MS`                | `60000` | Minimum gap between RTK measurements, per project.                            |
+| `RTK_MAX_AGE_MS`            | `1800000` | Age at which an RTK figure stops being drawn at all.                        |
+| `RTK_MAX_ENTRIES`           | `16`    | Projects kept in the RTK cache before the oldest is evicted.                  |
 
 In `subagent-statusline.js`:
 
@@ -1309,6 +1516,7 @@ In `subagent-statusline.js`:
 | Variable                  | Effect                                                                               |
 | ------------------------- | ------------------------------------------------------------------------------------ |
 | `CC_STATUSLINE_NOGIT=1`   | Skip the git subprocess entirely. Saves ~79 ms per render.                           |
+| `CC_STATUSLINE_NORTK=1`   | Turn off the [RTK badge](#rtk-savings-badge): no cache read, no measurement spawned.  |
 | `NO_COLOR=1`              | Disable all ANSI colour ([no-color.org](https://no-color.org) convention).           |
 | `CC_STATUSLINE_NOCOLOR=1` | Same, without affecting other tools.                                                 |
 | `CC_STATUSLINE_ASCII=1`   | Replace `↑ → ↓ ⎇ ✓ ⇡ ⇣ ↺` with `^ = v br ok ^ v ~`. Use if your console font boxes them. |
@@ -1359,12 +1567,12 @@ Observed degradation:
 
 ```text
 COLUMNS=96  Opus 5 (1M context) XHigh Thinking [FAST] [CAVEMAN:ULTRA] [PONYTAIL:ULTRA]
-            Ctx 15% · In 152,002 Out 878 · Cache 92% · LngCtx 76% · 5h 6%:34%↓:3h · 7d 1%:17%↓:5d
+            Ctx 15% · In 152,002 Out 878 · Cache 92%:2:41 · LngCtx 76% · 5h 6%:34%↓:3h · 7d 1%:17%↓:5d
             S $4.87 · D $24.14 · W $24.14 · M $24.14 · $19.48/hr · API 25%
             my-project · ⎇ main ?1 · statusline-hardening-and-git-state
 
 COLUMNS=74  Opus 5 (1M context) XHigh [FAST] [CAVEMAN:ULTRA] [PONYTAIL:ULTRA]
-            Ctx 15% · Cache 92% · LngCtx 76% · 5h 6%:34%↓:3h · 7d 1%:17%↓:5d
+            Ctx 15% · Cache 92%:2:41 · LngCtx 76% · 5h 6%:34%↓:3h · 7d 1%:17%↓:5d
             S $4.87 · D $24.14 · W $24.14 · M $24.14 · $19.48/hr · API 25%
             my-project · ⎇ main ?1 · statusline-hardening-and-git-state
 
@@ -1454,13 +1662,13 @@ by copy/paste, by editors, and by `core.autocrlf`.
 
 **`Fable ~n%` never loses its tilde.**
 The tilde means the estimate is running because no server figure is available.
-In order: is the flag there (`ls <config>/.statusline-usage`)? Is
-`CC_STATUSLINE_USAGE=0` set anywhere? Then run the refresh child in the
-foreground and look at what it leaves behind:
+In order: is the opt-in there (`usage: true` in
+`<config>/statusline/state.json`)? Is `CC_STATUSLINE_USAGE=0` set anywhere?
+Then run the refresh child in the foreground and look at what it leaves behind:
 
 ```bash
 node ~/.claude/statusline.js --usage-refresh
-cat ~/.claude/.statusline-usage.json
+cat ~/.claude/statusline/usage.json
 ```
 
 No file means the request failed. The usual causes are an expired token - open
@@ -1475,7 +1683,7 @@ curl -s -H "Authorization: Bearer $(security find-generic-password -s 'Claude Co
 ```
 
 A snapshot that exists but is over an hour old is treated as stale by design and
-the estimate takes over; delete `.statusline-usage-check` to force a retry now
+the estimate takes over; delete `statusline/jobs.json` to force a retry now
 rather than waiting out the TTL.
 
 **The bar is blank.**
@@ -1534,6 +1742,20 @@ the opening 2% of a window - 6 minutes into a 5-hour window, ~3.4 hours into a
 **Cache shows `0%`.** Expected before the first API call and immediately after
 `/compact` - with no transcript history yet, `current_usage` is null in both
 states and there is nothing to divide.
+
+**Cache shows no `:m:ss` countdown.** Expected while the assistant is working -
+the clock only runs between turns, see [Cache TTL](#cache-ttl). If it is also
+absent when nothing is running, the session has not written a response yet or
+the transcript could not be read at all - the same cause that pins `Out` at a
+few hundred.
+
+**The TTL countdown jumps several seconds at a time.** It only moves when the bar
+redraws. Set `refreshInterval` to `1` - see [`refreshInterval`](#refreshinterval).
+
+**The TTL opens at `0:00` on a resumed session.** Correct, and deliberate. The
+catch-up read stamps from the transcript's mtime, so a session resumed hours
+later reports the cache it actually has rather than a fresh five minutes. The
+first new response restarts the clock.
 
 **`Out` looks stuck at a few hundred.** That is the payload fallback, meaning
 the transcript could not be read. Check that `transcript_path` in the payload
