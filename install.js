@@ -33,7 +33,8 @@
  *                                       <config>/.statusline-* dotfiles
  *
  *   <config> is $CLAUDE_CONFIG_DIR, else ~/.claude. Never anything outside it.
- *   The cost ledger is user data and is never written or deleted by default.
+ *   The cost ledger moves into <config>/statusline/ with everything else, but
+ *   it is user data: never written, and never deleted without --purge.
  *
  * SAFETY
  *   Nothing is installed until every file has been fetched AND passed
@@ -66,13 +67,17 @@ const STATE_FILE = 'state.json';
 const JOBS_FILE = 'jobs.json';
 const USAGE_CACHE = 'usage.json';
 const RTK_CACHE = 'rtk.json';
+const LEDGER = 'cost_ledger.json';
 
 // The layout before those four files existed: eight dotfiles at the top level
 // of <config>. Migrated on install, removed on uninstall, and still readable
 // by a statusline.js that has self-updated but not been re-installed.
-const LEGACY_CACHES = {
+// Files worth keeping, and where they now live. The ledger is here for the
+// same reason the caches are: moved, never dropped.
+const LEGACY_MOVES = {
   '.statusline-usage.json': USAGE_CACHE,
   '.statusline-rtk.json': RTK_CACHE,
+  [LEDGER]: LEDGER,
 };
 const LEGACY_FILES = [
   '.statusline-manifest.json',
@@ -411,12 +416,12 @@ function readState(dir) {
 function migrateLegacy(dir) {
   let touched = 0;
 
-  for (const [from, to] of Object.entries(LEGACY_CACHES)) {
+  for (const [from, to] of Object.entries(LEGACY_MOVES)) {
     const legacy = path.join(dir, from);
     if (!fs.existsSync(legacy)) continue;
     try {
       const dest = path.join(dir, STATE_DIR, to);
-      // A cache already written at the new path is newer than this one by
+      // A file already written at the new path is newer than this one by
       // definition -- the status line only writes there after the move.
       if (fs.existsSync(dest)) fs.unlinkSync(legacy);
       else fs.renameSync(legacy, dest);
@@ -612,11 +617,14 @@ function uninstall(opts) {
     ? [
         ...[STATE_FILE, JOBS_FILE, USAGE_CACHE, RTK_CACHE].map((n) => path.join(STATE_DIR, n)),
         ...LEGACY_FILES,
-        ...Object.keys(LEGACY_CACHES),
+        // The ledger is excluded here and handled below: it is the one file
+        // uninstall keeps.
+        ...Object.keys(LEGACY_MOVES).filter((n) => n !== LEDGER),
       ]
     : [];
-  // cost_ledger.json is your cost history, not our file. --purge only.
-  const ledger = opts.purge ? ['cost_ledger.json'] : [];
+  // cost_ledger.json is your cost history, not our file. --purge only, and
+  // then from both layouts -- an upgrade may have left a copy at either path.
+  const ledger = opts.purge ? [LEDGER, path.join(STATE_DIR, LEDGER)] : [];
 
   for (const name of [...files, ...extras, ...ledger]) {
     const target = path.join(dir, name);
@@ -631,8 +639,10 @@ function uninstall(opts) {
     try { fs.rmdirSync(path.join(dir, STATE_DIR)); } catch { /* not empty, or not there */ }
   }
 
-  if (!opts.purge && fs.existsSync(path.join(dir, 'cost_ledger.json'))) {
-    say(`${tag}kept     cost_ledger.json (your cost history — --purge deletes it)`);
+  const keptLedger = [path.join(STATE_DIR, LEDGER), LEDGER]
+    .find((n) => fs.existsSync(path.join(dir, n)));
+  if (!opts.purge && keptLedger) {
+    say(`${tag}kept     ${posix(keptLedger)} (your cost history — --purge deletes it)`);
   }
 
   say(opts.dryRun ? '\nDry run. Nothing changed.\n' : '\nDone.\n');

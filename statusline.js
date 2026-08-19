@@ -1024,7 +1024,7 @@ function cachedGitState(rec, cwd, nowMs) {
  * ----------------------------------------------------------------------------
  * The payload only ever exposes `cost.total_cost_usd` for the *current* session
  * and it resets to $0 on /clear. To get day/week/month totals we keep our own
- * append-and-max ledger at ~/.claude/cost_ledger.json:
+ * append-and-max ledger at ~/.claude/statusline/cost_ledger.json:
  *
  *   { "v": 1, "sessions": { "<session_id>": { first, last, cost } } }
  *
@@ -1043,8 +1043,13 @@ function cachedGitState(rec, cwd, nowMs) {
  * historical bucket stable once written.
  * ------------------------------------------------------------------------ */
 
+// Keeps its name through the move into statusline/: this is the one file here
+// that is the user's data rather than our state, and people have it in
+// backups, scripts and muscle memory. A new directory is enough discontinuity.
+const LEDGER_FILE = 'cost_ledger.json';
+
 function ledgerPath() {
-  return path.join(claudeDir(), 'cost_ledger.json');
+  return statePath(LEDGER_FILE);
 }
 
 /**
@@ -1336,16 +1341,29 @@ function contextState(d, rec) {
   return { input: shrunk ? t : null, pct: shrunk ? pctOf(t) : null, compacted: true, changed };
 }
 
+/**
+ * The store at `file`, or the one still at the pre-consolidation path, or an
+ * empty one.
+ *
+ * The fallback is what migrates a history nobody has re-installed: the whole
+ * store is rewritten on the next save, so it lands at the new path intact, and
+ * the old file is ignored from then on. Months of spend must not reset to zero
+ * because a directory changed.
+ */
 function loadLedger(file) {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
-    if (parsed && typeof parsed === 'object' && parsed.sessions && typeof parsed.sessions === 'object') {
-      return parsed;
+  const read = (p) => {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(p, 'utf8'));
+      if (parsed && typeof parsed === 'object' && parsed.sessions && typeof parsed.sessions === 'object') {
+        return parsed;
+      }
+    } catch {
+      /* absent on first run, or corrupt after a hard kill -- start clean */
     }
-  } catch {
-    /* absent on first run, or corrupt after a hard kill -- start clean */
-  }
-  return { v: 1, sessions: {} };
+    return null;
+  };
+
+  return read(file) || read(path.join(claudeDir(), LEDGER_FILE)) || { v: 1, sessions: {} };
 }
 
 /**

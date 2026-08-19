@@ -313,11 +313,12 @@ check('rate limit renders used:on_pace:reset in that order', () => {
 /* --- billed plans: API key, Bedrock, Vertex, Enterprise ------------------ */
 
 const LEDGER = 'cost_ledger.json';
+const LEDGER_PATH = path.join(STATE_DIR, LEDGER);
 
 /** A config dir whose ledger already holds `sessions`. */
 function seededSandbox(sessions) {
   const dir = sandbox();
-  fs.writeFileSync(path.join(dir, LEDGER), JSON.stringify({ v: 1, sessions }), 'utf8');
+  writeStateFile(dir, LEDGER, { v: 1, sessions });
   return dir;
 }
 
@@ -541,7 +542,7 @@ check('a hostile session_id cannot become a ledger record', () => {
   const dir = sandbox();
   const r = run(MAIN, basePayload({ session_id: '__proto__' }), { configDir: dir });
   assert(r.status === 0, `exit ${r.status}`);
-  const file = path.join(dir, 'cost_ledger.json');
+  const file = statePath(dir, LEDGER);
   if (fs.existsSync(file)) {
     const store = JSON.parse(fs.readFileSync(file, 'utf8'));
     assert(
@@ -599,7 +600,7 @@ check('a pre-bucket record is migrated onto the day it started', () => {
   const y = Date.now() - 25 * 3600 * 1000;
   const dir = seededSandbox({ [id]: { first: y, last: y, cost: 5 } });
   run(MAIN, basePayload({ session_id: id, cost: { total_cost_usd: 8 } }), { configDir: dir });
-  const rec = JSON.parse(fs.readFileSync(path.join(dir, LEDGER), 'utf8')).sessions[id];
+  const rec = JSON.parse(fs.readFileSync(statePath(dir, LEDGER), 'utf8')).sessions[id];
   assert(rec.days[dayKeyOf(y)][0] === 5, 'the pre-existing total was not folded onto its own day');
   assert(rec.days[dayKeyOf(Date.now())][0] === 3, 'the delta did not land on today');
   assert(rec.cost === 8, 'the running total must still be the session total');
@@ -641,7 +642,7 @@ check('a bucket older than the retention horizon is dropped', () => {
     [id]: { first: Date.now(), last: Date.now(), cost: 1, days: { [dayKeyOf(old)]: [99, 0] } },
   });
   run(MAIN, basePayload({ session_id: id }), { configDir: dir });
-  const rec = JSON.parse(fs.readFileSync(path.join(dir, LEDGER), 'utf8')).sessions[id];
+  const rec = JSON.parse(fs.readFileSync(statePath(dir, LEDGER), 'utf8')).sessions[id];
   assert(rec.days[dayKeyOf(old)] === undefined, 'a 60-day-old bucket survived the sweep');
 });
 
@@ -655,7 +656,7 @@ check('a Fable delta lands in the bucket, not on the whole session', () => {
     model: { display_name: 'Fable 5' },
     cost: { total_cost_usd: 10 },
   }), { configDir: dir });
-  const rec = JSON.parse(fs.readFileSync(path.join(dir, LEDGER), 'utf8')).sessions[id];
+  const rec = JSON.parse(fs.readFileSync(statePath(dir, LEDGER), 'utf8')).sessions[id];
   const today = rec.days[dayKeyOf(Date.now())];
   assert(today[0] === 10, `today's total should be 10, got ${today[0]}`);
   assert(today[1] === 6, `only the 6 spent under Fable is Fable's, got ${today[1]}`);
@@ -702,7 +703,7 @@ function usageSandbox(id, opts = {}) {
   if (calib !== undefined) store.fcal = { k: calib, at: now };
 
   const dir = sandbox();
-  fs.writeFileSync(path.join(dir, LEDGER), JSON.stringify(store), 'utf8');
+  writeStateFile(dir, LEDGER, store);
   writeStateFile(dir, 'state.json', { usage: flag });
   if (limits) {
     writeStateFile(dir, USAGE_CACHE, { v: 1, at: now - ageMs, limits });
@@ -711,7 +712,7 @@ function usageSandbox(id, opts = {}) {
   return dir;
 }
 
-const readLedger = (dir) => JSON.parse(fs.readFileSync(path.join(dir, LEDGER), 'utf8'));
+const readLedger = (dir) => JSON.parse(fs.readFileSync(statePath(dir, LEDGER), 'utf8'));
 
 check('with the flag absent the estimate runs and is marked as one', () => {
   const id = '00000000-0000-4000-8000-0000000000e1';
@@ -958,7 +959,7 @@ check('a stale git cache is refreshed and written back', () => {
   const dir = seededSandbox({ [id]: gitCacheRec({ gTs: Date.now() - 60000 }) });
   const r = run(MAIN, gitPayload(id), { configDir: dir });
   assertNotMatch(r.stdout, GIT_SENTINEL, 'a minute-old entry must not be served');
-  const rec = JSON.parse(fs.readFileSync(path.join(dir, LEDGER), 'utf8')).sessions[id];
+  const rec = JSON.parse(fs.readFileSync(statePath(dir, LEDGER), 'utf8')).sessions[id];
   assert(rec.gTs > Date.now() - 30000, 'the cache timestamp was not refreshed');
   assert(!rec.gSt || rec.gSt.branch !== GIT_SENTINEL, 'the stale status survived the refresh');
 });
@@ -983,7 +984,7 @@ check('a cold render records the git cache in the ledger', () => {
   const dir = sandbox();
   const r = run(MAIN, gitPayload(id), { configDir: dir });
   assert(r.status === 0, `exit ${r.status}`);
-  const rec = JSON.parse(fs.readFileSync(path.join(dir, LEDGER), 'utf8')).sessions[id];
+  const rec = JSON.parse(fs.readFileSync(statePath(dir, LEDGER), 'utf8')).sessions[id];
   assert(rec.gDir === ROOT, 'the cache is not keyed on the directory');
   assert(typeof rec.gTs === 'number', 'no cache timestamp was written');
 });
@@ -992,7 +993,7 @@ check('CC_STATUSLINE_NOGIT writes no git cache at all', () => {
   const id = '00000000-0000-4000-8000-0000000000c6';
   const dir = sandbox();
   run(MAIN, gitPayload(id), { configDir: dir, env: { CC_STATUSLINE_NOGIT: '1' } });
-  const rec = JSON.parse(fs.readFileSync(path.join(dir, LEDGER), 'utf8')).sessions[id];
+  const rec = JSON.parse(fs.readFileSync(statePath(dir, LEDGER), 'utf8')).sessions[id];
   assert(rec.gTs === undefined, 'git was consulted despite CC_STATUSLINE_NOGIT');
 });
 
@@ -1627,7 +1628,7 @@ check('--uninstall removes our keys and files but keeps the ledger', () => {
   const dir = sandbox();
   fs.writeFileSync(path.join(dir, 'settings.json'), JSON.stringify({ model: 'opus' }));
   installer(['--dir', dir, '--local', '--auto-update']);
-  fs.writeFileSync(path.join(dir, 'cost_ledger.json'), '{"sessions":{}}');
+  writeStateFile(dir, LEDGER, { sessions: {} });
 
   const r = installer(['--dir', dir, '--uninstall']);
   assert(r.status === 0, `exit ${r.status}\n${r.stderr}`);
@@ -1640,16 +1641,20 @@ check('--uninstall removes our keys and files but keeps the ledger', () => {
   for (const name of ['statusline.js', 'subagent-statusline.js', path.join(STATE_DIR, 'state.json')]) {
     assert(!exists(dir, name), `${name} survived`);
   }
-  assert(!exists(dir, STATE_DIR), 'the state directory survived');
-  assert(exists(dir, 'cost_ledger.json'), 'the ledger must be kept without --purge');
+  assert(exists(dir, LEDGER_PATH), 'the ledger must be kept without --purge');
+  // The directory goes only when it is empty, and the kept ledger is in it.
+  assert(fs.readdirSync(path.join(dir, STATE_DIR)).join() === LEDGER, 'state other than the ledger survived');
 });
 
-check('--uninstall --purge deletes the ledger too', () => {
+check('--uninstall --purge deletes the ledger from both layouts', () => {
   const dir = sandboxPath();
   installer(['--dir', dir, '--local']);
-  fs.writeFileSync(path.join(dir, 'cost_ledger.json'), '{"sessions":{}}');
+  writeStateFile(dir, LEDGER, { sessions: {} });
+  fs.writeFileSync(path.join(dir, LEDGER), '{"sessions":{}}', 'utf8');   // an unmigrated copy
   installer(['--dir', dir, '--uninstall', '--purge']);
-  assert(!exists(dir, 'cost_ledger.json'), 'the ledger survived --purge');
+  assert(!exists(dir, LEDGER_PATH), 'the ledger survived --purge');
+  assert(!exists(dir, LEDGER), 'the pre-move ledger survived --purge');
+  assert(!exists(dir, STATE_DIR), 'the state directory survived a purge');
 });
 
 check('--uninstall --main-only leaves the subagent half installed', () => {
@@ -1790,9 +1795,27 @@ check('a legacy auto-update flag and manifest still arm the updater', () => {
   assert(jobStamp(dir, 'update') !== undefined, 'the legacy flag did not arm the updater');
 });
 
+check('a ledger left at the old path is read, then rewritten at the new one', () => {
+  const id = '00000000-0000-4000-8000-0000000000b2';
+  const dir = sandbox();
+  const day = dayKeyOf(Date.now());
+  // $8 of history, at the pre-move path and nowhere else.
+  fs.writeFileSync(
+    path.join(dir, LEDGER),
+    JSON.stringify({ v: 1, sessions: { old: { first: Date.now(), last: Date.now(), cost: 8, days: { [day]: [8, 0] } } } }),
+    'utf8'
+  );
+
+  const r = run(MAIN, basePayload({ session_id: id, cost: { total_cost_usd: 2 } }), { configDir: dir });
+  assertMatch(r.stdout, 'D $10.00', 'the old history was not carried forward');
+  assert(exists(dir, LEDGER_PATH), 'the ledger was not rewritten at the new path');
+  assert(readLedger(dir).sessions.old.cost === 8, 'the migrated store lost a session');
+});
+
 check('installing migrates the old layout and removes it', () => {
   const dir = sandbox();
   const legacy = {
+    'cost_ledger.json': '{"v":1,"sessions":{}}',
     '.statusline-manifest.json': '{"files":{}}',
     '.statusline-autoupdate': '',
     '.statusline-last-update': 'x',
@@ -1816,6 +1839,7 @@ check('installing migrates the old layout and removes it', () => {
   }
   assert(exists(dir, path.join(STATE_DIR, 'rtk.json')), 'the RTK cache was not moved');
   assert(exists(dir, path.join(STATE_DIR, 'usage.json')), 'the usage cache was not moved');
+  assert(exists(dir, LEDGER_PATH), 'the ledger was not moved');
   assert(readStateFile(dir, 'state.json').usage === true, 'the opt-in did not land in state.json');
 });
 

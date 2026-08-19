@@ -10,7 +10,7 @@ in four lines. Runs on Windows, macOS and Linux from the same files.
 | --------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
 | Install   | One piped command - see [Installation](#installation)                                                                                      |
 | Scripts   | `~/.claude/statusline.js` (3095 lines) · `~/.claude/subagent-statusline.js` (390 lines)                                                    |
-| Ledger    | `~/.claude/cost_ledger.json` (created on first run)                                                                                        |
+| Ledger    | `~/.claude/statusline/cost_ledger.json` (created on first run)                                                                              |
 | Config    | `statusLine` and `subagentStatusLine` blocks in `~/.claude/settings.json`                                                                  |
 | Runtime   | Node.js ≥ 14.17 - built-ins only (`fs`, `path`, `os`, `child_process`; `https`/`crypto` lazily, in the optional updater). No dependencies. |
 | Platforms | Windows, macOS, Linux                                                                                                                      |
@@ -159,8 +159,8 @@ either without the other. See
 | `<config>/statusline/state.json`     | sha256 of what was installed (for the update edit-check) plus the `--auto-update` and `--usage` opt-ins |
 
 `<config>` is `$CLAUDE_CONFIG_DIR` if set, else `~/.claude`. Nothing outside it
-is ever touched, and `cost_ledger.json` is never written or deleted by the
-installer.
+is ever touched. `cost_ledger.json` moves into `statusline/` with everything
+else, but its contents are never written or deleted by the installer.
 
 Installing also **migrates** the old layout - eight `.statusline-*` dotfiles at
 the top of `<config>` - into `<config>/statusline/`, and deletes what is left.
@@ -237,9 +237,10 @@ both caches - along with the [old `.statusline-*` layout](#state-on-disk) if any
 of it is still there. `settings.json` is backed up first and every other key is
 left alone.
 
-**`cost_ledger.json` is kept.** It is your cost history, not part of the
-install, and a reinstall picks up exactly where you left off. Add `--purge` to
-delete it too - that is not reversible.
+**`cost_ledger.json` is kept**, and `statusline/` with it. It is your cost
+history, not part of the install, and a reinstall picks up exactly where you
+left off. Add `--purge` to delete it too - from both layouts, and not
+reversibly.
 
 `--main-only` and `--subagent-only` work here as well, if you want to remove one
 half and keep the other.
@@ -322,7 +323,7 @@ echo "{\"model\":{\"display_name\":\"Opus\"},\"context_window\":{\"used_percenta
 Then confirm it is live inside Claude Code:
 
 ```bash
-node -e "console.log(require(require('os').homedir()+'/.claude/cost_ledger.json'))"
+node -e "console.log(require(require('os').homedir()+'/.claude/statusline/cost_ledger.json'))"
 ```
 
 If the ledger exists and contains your current session id, the statusline is
@@ -1242,7 +1243,7 @@ therefore require local state.
 
 ### File format
 
-`~/.claude/cost_ledger.json`:
+`~/.claude/statusline/cost_ledger.json`:
 
 ```json
 {
@@ -1346,10 +1347,10 @@ Delete the file. It is recreated on the next render, and the transcript token
 totals re-accumulate from scratch on the first render of each session.
 
 ```bash
-node -e "const os=require('os');require('fs').unlinkSync(os.homedir()+'/.claude/cost_ledger.json')"
+node -e "const os=require('os');require('fs').unlinkSync(os.homedir()+'/.claude/statusline/cost_ledger.json')"
 ```
 
-Or just delete `~/.claude/cost_ledger.json` however you like.
+Or just delete `~/.claude/statusline/cost_ledger.json` however you like.
 
 A corrupt file is silently discarded and recreated rather than crashing the bar,
 so there is no state you can get stuck in.
@@ -1439,10 +1440,12 @@ Everything the status line keeps lives in `<config>/statusline/`, one file per
 | `jobs.json`  | the render process                 | epoch-ms stamp per background job: `update`, `usage`, `rtk`  |
 | `usage.json` | the `--usage-refresh` child        | the cached rate-limit snapshot                               |
 | `rtk.json`   | the `--rtk-refresh` child          | the cached savings figure, per project                       |
+| `cost_ledger.json` | the render process           | per-session cost and token history, bucketed by day          |
 
-`cost_ledger.json` stays where it is, at the top of `<config>`: it is your cost
-history rather than our state, `--uninstall` keeps it, and only `--purge`
-deletes it.
+The ledger is here too - it has exactly one writer, like the job stamps - but
+it is the one file that is your data rather than our state. It keeps its name
+through the move, `--uninstall` keeps it (and the directory with it), and only
+`--purge` deletes it.
 
 ### Why grouped by writer
 
@@ -1471,7 +1474,8 @@ statSync a flag                    0.013ms
 Before this, the same state was eight dotfiles directly under `<config>`:
 `.statusline-manifest.json`, `.statusline-autoupdate`, `.statusline-usage`,
 `.statusline-usage.json`, `.statusline-usage-check`, `.statusline-rtk.json`,
-`.statusline-rtk-check` and `.statusline-last-update`.
+`.statusline-rtk-check` and `.statusline-last-update` - plus `cost_ledger.json`
+beside them.
 
 Nothing needs doing:
 
@@ -1479,9 +1483,13 @@ Nothing needs doing:
   `statusline.js` that self-updated before `install.js` was re-run keeps its
   opt-ins and its cached figures. Once the new file exists the fallback is never
   consulted again, so the transition costs nothing in the steady state.
-- **The installer migrates** on its next run: the two caches move, the rest is
-  deleted. The three job stamps are not carried over - losing them costs one
-  early run of each background job.
+- **The installer migrates** on its next run: the ledger and the two caches
+  move, the rest is deleted. The three job stamps are not carried over - losing
+  them costs one early run of each background job.
+- **The ledger migrates itself** even without the installer: the whole store is
+  rewritten on every save, so the first render after the upgrade reads the old
+  path and writes the new one with the history intact. Months of spend must not
+  reset because a directory changed.
 - **`--uninstall` removes both layouts**, and the `statusline/` directory itself
   when nothing else is left in it.
 
@@ -1761,7 +1769,7 @@ first new response restarts the clock.
 the transcript could not be read. Check that `transcript_path` in the payload
 exists. Deleting the ledger forces a clean re-accumulation.
 
-**`Out` looks far too large.** Delete `cost_ledger.json`. A ledger written by an
+**`Out` looks far too large.** Delete `statusline/cost_ledger.json`. A ledger written by an
 older build, before streamed duplicates were deduped, overcounts by roughly
 1.8×.
 
