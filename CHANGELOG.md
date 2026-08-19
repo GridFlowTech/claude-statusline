@@ -8,6 +8,16 @@ from it — so sections are dated rather than numbered, newest first.
 
 ## 2026-08-19
 
+### Added
+
+- `test/demo.js` renders the four README screenshot fixtures — an everyday
+  subscription session, a billed plan against a monthly allocation, the subagent
+  panel, and every cell populated at once. Everything the statusline reads is
+  real: a scratch git repo carrying genuine staged/modified/untracked/ahead/behind
+  state, a seeded ledger and RTK cache, and synthesised transcripts whose mtimes
+  are backdated across all three prompt-cache colour tiers. It writes only to a
+  throwaway `CLAUDE_CONFIG_DIR`, so it never touches a real ledger.
+
 ### Changed
 
 - The cost ledger moved to `<config>/statusline/cost_ledger.json`, completing the
