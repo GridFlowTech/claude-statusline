@@ -358,7 +358,7 @@ Opus 5 (1M context) XHigh Thinking [FAST] [CAVEMAN:ULTRA] [PONYTAIL:ULTRA] [RTK:
 ### Line 2 - runway
 
 ```text
-Ctx 15% · In 152,002 Out 153,470 · Cache 98%:4:12 · LngCtx 76% · 5h 90%:20%↑ 02:41:4h · 7d 52%:50%→ 08:06:3d
+Ctx 15% · In 152,002 Out 153,470 · Cache 98%:4:12 · LngCtx 76% · 5h 90%:20%↑ 6m:3h58m · 7d 52%:50%→ 3d:3d
 ```
 
 | Cell        | Source                              | Notes                                                                  |
@@ -385,7 +385,7 @@ deployment the windows are replaced by the budget gauge and the blended token
 rate rather than sitting there reading `n/a` forever:
 
 ```text
-Ctx 76% · In 152,002 Out 153,470 · Cache 98%:4:12 · Bgt $24.36/250:11h · $/Mtok 12.83
+Ctx 76% · In 152,002 Out 153,470 · Cache 98%:4:12 · Bgt $24.36/250:11h20m · $/Mtok 12.83
 ```
 
 That one is a 200k model, which is also why `LngCtx` is absent - see
@@ -395,7 +395,7 @@ That one is a 200k model, which is also why `LngCtx` is absent - see
 three limit gauges read left to right as one group:
 
 ```text
-Ctx 15% · In 152,002 Out 878 · Cache 92%:2:41 · 5h 6%:34%↓:3h · 7d 41%:50%↓:3d · Fable 82%
+Ctx 15% · In 152,002 Out 878 · Cache 92%:2:41 · 5h 6%:34%↓:3h18m · 7d 41%:50%↓:3d · Fable 82%
 ```
 
 ### Line 3 - money
@@ -568,9 +568,10 @@ costs you the branch cell permanently.
 ### Rate limits
 
 ```text
-5h 90%:20%↑ 02:41:4h
-   |   |  |     |  `- time until this window resets
-   |   |  `- projected exhaustion clock
+5h 90%:20%↑ 6m:3h58m
+   |   |  | |    `- time until this window resets
+   |   |  | `- time until the limit is projected to hit 100%
+   |   |  `- pace arrow
    |   `- on_pace%
    `- used%
 ```
@@ -607,18 +608,18 @@ tells you which situation you are in. That comparison is the arrow.
 
 #### The three states
 
-| Arrow | Colour | Meaning                                                               | Exhaustion clock                  |
-| ----- | ------ | --------------------------------------------------------------------- | --------------------------------- |
-| `↑`   | red    | Burning too fast. **The limit will be hit before the window resets.** | Yes - projected time you hit 100% |
-| `→`   | yellow | On pace to land almost exactly on 100% at reset.                      | Yes                               |
-| `↓`   | green  | Under-consuming. The limit will not be reached this window.           | No - there is nothing to project  |
+| Arrow | Colour | Meaning                                                               | Exhaustion span                        |
+| ----- | ------ | --------------------------------------------------------------------- | -------------------------------------- |
+| `↑`   | red    | Burning too fast. **The limit will be hit before the window resets.** | Yes - how long until you hit 100%      |
+| `→`   | yellow | On pace to land almost exactly on 100% at reset.                      | Only when the rate projects to ≥ 100%  |
+| `↓`   | green  | Under-consuming. The limit will not be reached this window.           | No - there is nothing to project       |
 
 Worked examples, both from a 5-hour window with 17 minutes left (so ~94% of the
 window has elapsed):
 
 ```text
-5h 8%:94%↓:17m      ample headroom - 8% consumed where linear burn would be at 94%
-5h 94%:8%↑ 16:20    critical - 94% consumed in the first 8% of the window
+5h 8%:94%↓:17m       ample headroom - 8% consumed where linear burn would be at 94%
+5h 94%:8%↑ 1m:17m   critical - 94% consumed in the first 8% of the window
 ```
 
 The second reading is the one worth catching early. `94%` alone looks survivable
@@ -645,18 +646,32 @@ of noise flips the arrow - and far too loose at hour 1, where 5 points is a
 wildly different trajectory. The ±15% ratio band behaves correctly at both ends.
 Thresholds live in `PACE_FAST_PROJECTED` and `PACE_SLOW_PROJECTED`.
 
-#### The exhaustion clock
+#### The exhaustion span
 
 ```text
-exhaust_at = start + elapsed * (100 / used%)
+exhaust_in = start + elapsed * (100 / used%) - now
 where  start = resets_at - duration
 ```
 
-Shown for `↑` and `→` only. It is provably earlier than `resets_at` exactly when
-`used% > on_pace%`, which is precisely when those two arrows appear - so the
-time printed is never one the window reset would have preempted.
+Shown for `↑` and `→`, and only when the projected landing is **at or past
+100%**. That last condition is doing real work: the `→` band opens at a
+projected 85%, so a rate that lands short of the limit would otherwise print an
+exhaustion time falling _after_ `resets_at` - a deadline the window reset
+preempts, and one the meter can never actually reach.
 
-The clock is coloured independently of the arrow, by how much of the _remaining_
+It is a **span, not a wall clock**. Two reasons:
+
+- It sits immediately beside the reset span. A bare `23:59` next to `1h57m`
+  reads as twenty-three hours, not as a time of day.
+- The clock form is restless. `used%` only moves when the host refreshes it from
+  the server, and between refreshes `exhaust_at` drifts later at `100 / used%`
+  times real time - about 1.4× at 71% used - so the digits change on every
+  render and snap back whenever a new figure lands. The span drifts by
+  `elapsed * (100 - used%) / used%`, which grows at only `(100 - used%) / used%`
+  per minute: 0.4 min/min at 71% used, and standing perfectly still at 50%. Same
+  projection, far less churn.
+
+The span is coloured independently of the arrow, by how much of the _remaining_
 window it eats:
 
 | Time to exhaustion, as a share of time to reset | Colour |
@@ -665,8 +680,8 @@ window it eats:
 | < 66%                                           | orange |
 | otherwise                                       | green  |
 
-So `↑` with a green clock means "you will run out, but not for a while", and
-`↑` with a red clock means "you will run out very shortly".
+So `↑` with a green span means "you will run out, but not for a while", and
+`↑` with a red span means "you will run out very shortly".
 
 #### Suppression
 
@@ -690,7 +705,7 @@ instead, so the two window cells give way to a spend gauge against an allocation
 you set:
 
 ```text
-Bgt $34.63/250:6h
+Bgt $34.63/250:6h20m
     |      |   `- time until the allocation runs out at the current burn rate
     |      `- the allocation
     `- spend so far this period
@@ -1437,7 +1452,7 @@ Everything the status line keeps lives in `<config>/statusline/`, one file per
 | File         | Written by                         | Contents                                                     |
 | ------------ | ---------------------------------- | ------------------------------------------------------------ |
 | `state.json` | `install.js`, and the update child | install hashes, `repo`/`ref`, `autoUpdate`, `usage`          |
-| `jobs.json`  | the render process                 | epoch-ms stamp per background job: `update`, `usage`, `rtk`  |
+| `jobs.json`  | the render process                 | epoch-ms stamp per background job: `update`, `usage`, `rtk`, `sweep` |
 | `usage.json` | the `--usage-refresh` child        | the cached rate-limit snapshot                               |
 | `rtk.json`   | the `--rtk-refresh` child          | the cached savings figure, per project                       |
 | `cost_ledger.json` | the render process           | per-session cost and token history, bucketed by day          |
@@ -1455,9 +1470,29 @@ unrelated update, and every write still lands atomically through tmp+rename.
 The two caches stay apart for exactly this reason - they are written by two
 different detached children, on independent cadences.
 
-The three job stamps share `jobs.json` because only the render process ever
-writes them. Two concurrent renders racing there cost at most one extra spawn,
-which is what a debounce is allowed to get wrong.
+The job stamps share `jobs.json` because only the render process ever writes
+them. Two concurrent renders racing there cost at most one extra spawn, which
+is what a debounce is allowed to get wrong.
+
+### Orphaned temp files
+
+Every write goes to `<name>.json.<pid>.tmp` and is renamed into place. The pid
+is what lets two concurrent renders write at once without one clobbering the
+other's temp - but it also means a render killed *between* the write and the
+rename leaves behind a uniquely named file that nothing would ever reclaim.
+Claude Code cancels in-flight status line processes the moment a new update
+arrives, so this is routine, not exotic; the writers' own `catch` blocks only
+fire when the write itself throws, and a `SIGKILL` does not run them.
+
+A fixed temp name per target would self-limit to one stray, but it would also
+let two renders write the same temp and rename a half-written file into place.
+So the pid stays and the strays are swept: once a day, after the frame is on
+screen, a render deletes any `*.json.<pid>.tmp` in `<config>/statusline/` that
+has not been touched for an hour. The hour is the safety margin - a live
+render's temp exists for well under a millisecond, but a process suspended
+mid-write should never have its temp pulled out from under it. Nothing outside
+that one directory, and nothing that does not match that exact shape, is
+touched.
 
 Merging is not a performance measure and does not pretend to be. Measured on a
 warm Windows box, a cache read costs 45µs against a ~35 ms node startup:
@@ -1575,22 +1610,22 @@ Observed degradation:
 
 ```text
 COLUMNS=96  Opus 5 (1M context) XHigh Thinking [FAST] [CAVEMAN:ULTRA] [PONYTAIL:ULTRA]
-            Ctx 15% · In 152,002 Out 878 · Cache 92%:2:41 · LngCtx 76% · 5h 6%:34%↓:3h · 7d 1%:17%↓:5d
+            Ctx 15% · In 152,002 Out 878 · Cache 92%:2:41 · LngCtx 76% · 5h 6%:34%↓:3h18m · 7d 1%:17%↓:5d
             S $4.87 · D $24.14 · W $24.14 · M $24.14 · $19.48/hr · API 25%
             my-project · ⎇ main ?1 · statusline-hardening-and-git-state
 
 COLUMNS=74  Opus 5 (1M context) XHigh [FAST] [CAVEMAN:ULTRA] [PONYTAIL:ULTRA]
-            Ctx 15% · Cache 92%:2:41 · LngCtx 76% · 5h 6%:34%↓:3h · 7d 1%:17%↓:5d
+            Ctx 15% · Cache 92%:2:41 · LngCtx 76% · 5h 6%:34%↓:3h18m · 7d 1%:17%↓:5d
             S $4.87 · D $24.14 · W $24.14 · M $24.14 · $19.48/hr · API 25%
             my-project · ⎇ main ?1 · statusline-hardening-and-git-state
 
 COLUMNS=56  Opus 5 (1M context) [CAVEMAN:ULTRA] [PONYTAIL:ULTRA]
-            Ctx 15% · LngCtx 76% · 5h 6%:34%↓:3h · 7d 1%:17%↓:5d
+            Ctx 15% · LngCtx 76% · 5h 6%:34%↓:3h18m · 7d 1%:17%↓:5d
             S $4.87 · D $24.14 · W $24.14 · M $24.14 · $19.48/hr
             my-project · ⎇ main ?1
 
 COLUMNS=38  Opus 5 (1M context) [CAVEMAN:ULTRA]
-            Ctx 15% · 5h 6%:34%↓:3h
+            Ctx 15% · 5h 6%:34%↓:3h18m
             S $4.87 · D $24.14 · W $24.14
             my-project · ⎇ main ?1
 ```

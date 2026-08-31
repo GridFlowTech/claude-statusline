@@ -6,6 +6,45 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The
 repository carries no version tags — the installer tracks `main` and self-updates
 from it — so sections are dated rather than numbered, newest first.
 
+## 2026-08-30
+
+### Added
+
+- A daily sweep reclaims abandoned `*.json.<pid>.tmp` files under
+  `<config>/statusline/`. Every write goes through tmp+rename, and the pid in
+  the name is what lets concurrent renders write at once — but a render killed
+  between the write and the rename (Claude Code cancels in-flight status line
+  processes on every new update) left a uniquely named file nothing would ever
+  reclaim. The writers' `catch` blocks only fire when the write itself throws;
+  a `SIGKILL` does not run them. The sweep runs after stdout, skips anything
+  touched in the last hour, and touches nothing outside that directory.
+- `claimJob(job, intervalMs)`, the stamp-and-debounce half of `spawnDebounced`,
+  extracted so a background job that spawns nothing can share it.
+
+### Changed
+
+- The rate-limit exhaustion projection is a **span** rather than a wall clock:
+  `5h 71%:61%↑ 1h14m:1h57m` instead of `5h 71%:61%↑ 23:59:1h`. The clock form
+  collided with the reset duration printed beside it — `23:59` next to `1h` reads
+  as a duration of twenty-three hours — and it was restless, drifting later at
+  `100 / used%` times real time between the host's refreshes of `used_percentage`
+  and snapping back whenever a new figure landed. The span drifts at only
+  `(100 - used%) / used%` per minute: 0.4 min/min at 71% used, and not at all
+  at 50%.
+- `fmtSpan` carries minutes alongside hours (`1h57m`, not `1h`). Flooring
+  understated a 5-hour window's reset by up to 59 minutes and put the exhaustion
+  and reset spans on different resolutions, so `1h15m:1h` read as though the
+  limit landed after the window reset. Also widens the `Bgt` projection.
+
+### Fixed
+
+- The exhaustion projection is suppressed when the current rate lands short of
+  100%. The `→` band opens at a projected 85%, so an on-pace reading could print
+  an exhaustion time falling after `resets_at` — a deadline the window reset
+  preempts, and one the meter could never reach. The README's claim that the
+  projected time "is provably earlier than `resets_at` … precisely when those two
+  arrows appear" held only for `↑`.
+
 ## 2026-08-19
 
 ### Added

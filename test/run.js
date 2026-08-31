@@ -280,7 +280,7 @@ check('pace arrow: burning fast shows an up arrow and an ETA', () => {
   }));
   assertMatch(r.stdout, '5h 90%:20%', 'used and on_pace');
   assertMatch(r.stdout, '\u2191', 'up arrow');
-  assert(/\u2191 \d\d:\d\d/.test(r.stdout), 'expected an HH:MM exhaustion clock after the up arrow');
+  assert(/\u2191 \d+m\b/.test(r.stdout), 'expected an exhaustion span after the up arrow');
 });
 
 check('pace arrow: on pace shows a right arrow', () => {
@@ -290,14 +290,31 @@ check('pace arrow: on pace shows a right arrow', () => {
   assertMatch(r.stdout, '\u2192', 'right arrow');
 });
 
+check('an on-pace rate that lands short of 100% projects no exhaustion span', () => {
+  // 40% used at 50% elapsed projects 80% at reset -- but 80 is inside the
+  // on-pace band's lower half, so the window resets before the limit is hit
+  // and any exhaustion time would fall after resets_at.
+  const r = run(MAIN, basePayload({
+    rate_limits: { five_hour: window_(40, 18000, 0.5), seven_day: window_(1, 604800, 0.5) },
+  }));
+  assert(!/5h 40%:50%[^\xb7]*\u2192 \d/.test(r.stdout), `unreachable ETA rendered: ${r.stdout}`);
+});
+
+check('the exhaustion span is a duration, never a wall clock', () => {
+  const r = run(MAIN, basePayload({
+    rate_limits: { five_hour: window_(90, 18000, 0.2), seven_day: window_(1, 604800, 0.5) },
+  }));
+  assert(!/\d\d:\d\d/.test(r.stdout), `HH:MM leaked into the line: ${r.stdout}`);
+});
+
 check('pace is suppressed in the first 2% of a window', () => {
   const r = run(MAIN, basePayload({
     rate_limits: { five_hour: window_(4, 18000, 0.01), seven_day: window_(1, 604800, 0.5) },
   }));
   // used% and time-to-reset still render; on_pace% and the arrow do not.
-  // Suppressed reads "5h 4%:4h"; unsuppressed reads "5h 4%:50%<arrow>:2h".
+  // Suppressed reads "5h 4%:4h57m"; unsuppressed reads "5h 4%:50%<arrow>:4h57m".
   // Match on the trailing "%" -- the reset duration also starts with a digit.
-  assert(/5h 4%:\d+[mhd]\b/.test(r.stdout), `expected used%:reset only, got: ${r.stdout}`);
+  assert(/5h 4%:(\d+m|\d+h\d\dm|\d+d)\b/.test(r.stdout), `expected used%:reset only, got: ${r.stdout}`);
   assert(!/5h 4%:\d+%/.test(r.stdout), 'on_pace% must be suppressed this early');
   assert(!/5h 4%:[^·]*[↑→↓]/.test(r.stdout), 'arrow must be suppressed this early');
 });
@@ -1733,6 +1750,54 @@ check('a render stamps the update job at most once a day', () => {
 
   run(path.join(dir, 'statusline.js'), basePayload(), { configDir: dir });
   assert(jobStamp(dir, 'update') === stamp, 're-stamped within the day');
+});
+
+/* --- orphaned temp files ------------------------------------------------- */
+
+/** Age a file so the sweep's minimum-age floor no longer protects it. */
+function ageFile(file, ms) {
+  const when = new Date(Date.now() - ms);
+  fs.utimesSync(file, when, when);
+}
+
+check('a render sweeps abandoned temp files, but only the old ones', () => {
+  const dir = sandbox();
+  const stateDir = path.join(dir, STATE_DIR);
+  fs.mkdirSync(stateDir, { recursive: true });
+
+  const stale = path.join(stateDir, 'cost_ledger.json.99999.tmp');
+  const fresh = path.join(stateDir, 'jobs.json.99998.tmp');
+  const other = path.join(stateDir, 'notes.txt');
+  for (const f of [stale, fresh, other]) fs.writeFileSync(f, '{}', 'utf8');
+  ageFile(stale, 2 * 60 * 60 * 1000);   // two hours: past the one-hour floor
+  ageFile(other, 2 * 60 * 60 * 1000);   // old, but not ours
+
+  run(MAIN, basePayload(), { configDir: dir });
+
+  assert(!fs.existsSync(stale), 'an hours-old temp survived the sweep');
+  assert(fs.existsSync(fresh), 'a temp younger than the floor was deleted');
+  assert(fs.existsSync(other), 'a file that is not ours was deleted');
+});
+
+check('the temp sweep runs at most once a day', () => {
+  const dir = sandbox();
+  const stateDir = path.join(dir, STATE_DIR);
+  fs.mkdirSync(stateDir, { recursive: true });
+
+  run(MAIN, basePayload(), { configDir: dir });
+  const stamp = jobStamp(dir, 'sweep');
+  assert(stamp !== undefined, 'the sweep was not stamped');
+
+  // A stray dropped after the day's sweep has already run must survive until
+  // tomorrow -- proof the stamp gates the scan rather than the scan running
+  // on every render.
+  const stale = path.join(stateDir, 'cost_ledger.json.99997.tmp');
+  fs.writeFileSync(stale, '{}', 'utf8');
+  ageFile(stale, 2 * 60 * 60 * 1000);
+
+  run(MAIN, basePayload(), { configDir: dir });
+  assert(jobStamp(dir, 'sweep') === stamp, 're-stamped within the day');
+  assert(fs.existsSync(stale), 'the sweep ran twice in one day');
 });
 
 check('a render is unaffected by a broken state file', () => {

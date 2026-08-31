@@ -412,13 +412,6 @@ function money(n) {
   return '$' + (Number.isFinite(n) ? n : 0).toFixed(2);
 }
 
-/** Epoch seconds -> local "HH:MM", 24-hour, zero-padded. */
-function clock(epochSeconds) {
-  const d = new Date(epochSeconds * 1000);
-  if (Number.isNaN(d.getTime())) return '';
-  return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
-}
-
 /** Colour a 0-100 percentage by how alarming it is. */
 function pctColor(p) {
   if (p >= 90) return red;
@@ -507,6 +500,8 @@ function claudeDir() {
  * Grouping by writer is what makes one file per group safe. No two processes
  * ever read-modify-write the same file, so no snapshot can be clobbered by an
  * unrelated update, and each write still lands atomically through tmp+rename.
+ * The temp files that rename leaves behind when a render is killed mid-write
+ * are reclaimed by sweepStateTemp(); see the block above it.
  * The three background jobs share jobs.json because only the render process
  * ever stamps them -- and two concurrent renders racing there cost at most one
  * extra spawn, which is what a debounce is allowed to get wrong.
@@ -568,6 +563,71 @@ function writeJsonFile(file, value) {
   } catch {
     try { fs.unlinkSync(tmp); } catch { /* nothing else to do */ }
     return false;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+ * Orphaned temp files
+ * ----------------------------------------------------------------------------
+ * Every writer here goes through tmp+rename, and the temp name carries the pid
+ * so two concurrent renders can never write the same one. The cost is that a
+ * render killed BETWEEN the write and the rename -- which Claude Code does
+ * routinely, cancelling in-flight statusline processes the moment a new update
+ * arrives -- leaves a uniquely named file behind that nothing will ever reclaim.
+ * The catch block in each writer only fires when the write itself throws, and a
+ * SIGKILL does not run it.
+ *
+ * A fixed temp name per target would self-limit to one stray, but it would also
+ * let two renders write the same temp and rename a half-written file into place.
+ * The pid stays; the strays get swept instead.
+ * ------------------------------------------------------------------------ */
+
+const SWEEP_JOB = 'sweep';
+const SWEEP_INTERVAL_MS = 24 * 60 * 60 * 1000;
+// Never touch a temp younger than this. A live render's temp exists for well
+// under a millisecond, but a process suspended mid-write (a laptop sleeping, a
+// stalled network drive) could hold one open far longer, and deleting a file
+// another process is about to rename is the one way this can do harm.
+const SWEEP_MIN_AGE_MS = 60 * 60 * 1000;
+// A ceiling on the scan. This runs after stdout, but a directory that has
+// somehow grown enormous must not turn a render into a filesystem crawl.
+const SWEEP_MAX_ENTRIES = 512;
+// Exactly what writeJsonFile and saveLedger produce: `<name>.json.<pid>.tmp`.
+// Anything else in the state directory belongs to someone else.
+const SWEEP_NAME = /^[\w.-]+\.json\.\d+\.tmp$/;
+
+/**
+ * Delete abandoned `*.json.<pid>.tmp` files under <config>/statusline/, at most
+ * once a day.
+ *
+ * Scoped to that one directory: the legacy layout's files sat directly under
+ * <config>, but nothing writes there any more, so a sweep that reached up into
+ * the user's config root would be all blast radius and no benefit.
+ *
+ * Never throws, and is only ever called after stdout has been written.
+ */
+function sweepStateTemp() {
+  try {
+    if (!claimJob(SWEEP_JOB, SWEEP_INTERVAL_MS)) return;
+
+    const dir = path.join(claudeDir(), STATE_DIR);
+    const cutoff = Date.now() - SWEEP_MIN_AGE_MS;
+    let seen = 0;
+
+    for (const name of fs.readdirSync(dir)) {
+      if (++seen > SWEEP_MAX_ENTRIES) break;
+      if (!SWEEP_NAME.test(name)) continue;
+
+      const file = path.join(dir, name);
+      // lstat, for the same reason readJsonFile uses it: a symlink planted in a
+      // shared config directory must not turn this into an arbitrary unlink.
+      const st = fs.lstatSync(file, { throwIfNoEntry: false });
+      if (!st || !st.isFile() || st.isSymbolicLink() || st.mtimeMs > cutoff) continue;
+
+      try { fs.unlinkSync(file); } catch { /* raced, or read-only -- try again tomorrow */ }
+    }
+  } catch {
+    /* housekeeping that cannot run is no reason to disturb the bar */
   }
 }
 
@@ -633,14 +693,36 @@ function readJobs() {
 }
 
 /**
- * Spawn `statusline.js <flag>` detached, at most once per `intervalMs`, using
- * `job`'s stamp in jobs.json as the debounce.
+ * Is `job` due? Stamps it and returns true when it is, false when the interval
+ * has not elapsed.
  *
- * All three background jobs -- the self-updater, the usage refresh and the RTK
- * measurement -- want exactly this, and they want it to behave IDENTICALLY.
- * The stamp is written BEFORE the spawn, never after: two renders can overlap
- * inside the 300ms debounce, and a job that fails must still wait out its
- * interval rather than re-arming on every render for the rest of it.
+ * Every background job -- the self-updater, the usage refresh, the RTK
+ * measurement, the temp sweep -- wants exactly this, and they want it to behave
+ * IDENTICALLY. The stamp is written BEFORE the caller does its work, never
+ * after: two renders can overlap inside the 300ms debounce, and a job that
+ * fails must still wait out its interval rather than re-arming on every render
+ * for the rest of it.
+ *
+ * @param job the key in jobs.json: 'update' | 'usage' | 'rtk' | 'sweep'
+ */
+function claimJob(job, intervalMs) {
+  const jobs = readJobs();
+  const stamp = num(jobs[job]);
+  // `age >= 0` rejects a stamp from the future: a clock stepping backwards
+  // (NTP correction, VM resume, a restored backup) would otherwise pin the
+  // job until real time caught up again.
+  const age = stamp === null ? Infinity : Date.now() - stamp;
+  if (age >= 0 && age < intervalMs) return false;
+
+  // The memo is mutated as well as the file, so a render that fires two jobs
+  // writes both stamps instead of the second overwriting the first.
+  jobs[job] = Date.now();
+  writeJsonFile(statePath(JOBS_FILE), jobs);
+  return true;
+}
+
+/**
+ * Spawn `statusline.js <flag>` detached, at most once per `intervalMs`.
  *
  * Never throws, and is only ever called after stdout has been written, so
  * nothing here can delay or disturb a frame.
@@ -650,18 +732,7 @@ function readJobs() {
  */
 function spawnDebounced(job, intervalMs, flag, cwd) {
   try {
-    const jobs = readJobs();
-    const stamp = num(jobs[job]);
-    // `age >= 0` rejects a stamp from the future: a clock stepping backwards
-    // (NTP correction, VM resume, a restored backup) would otherwise pin the
-    // job until real time caught up again.
-    const age = stamp === null ? Infinity : Date.now() - stamp;
-    if (age >= 0 && age < intervalMs) return;
-
-    // The memo is mutated as well as the file, so a render that fires two jobs
-    // writes both stamps instead of the second overwriting the first.
-    jobs[job] = Date.now();
-    writeJsonFile(statePath(JOBS_FILE), jobs);
+    if (!claimJob(job, intervalMs)) return;
 
     require('child_process')
       .spawn(process.execPath, [__filename, flag], {
@@ -1831,15 +1902,31 @@ function paceArrow(usedPct, resetsAt, durationSeconds, nowSeconds) {
     return { onPace, arrow: green(ASCII_ARROWS ? 'v' : '↓') };
   }
 
-  // Both the on-pace and burning-fast branches project an exhaustion clock.
+  // Both the on-pace and burning-fast branches reach here, but only a rate that
+  // lands ON or PAST 100% has an exhaustion to project: below that the window
+  // resets first, and `exhaustAt` falls after `resets` -- a time the meter can
+  // never actually reach. The on-pace band runs down to 85, so this is the
+  // difference between a real deadline and a fictional one.
+  //
   // used > 0 is guaranteed here: projected >= 85 with a positive elapsed can
   // only happen for a positive used.
   const exhaustAt = start + elapsed * (100 / used);
-  const eta = clock(exhaustAt);
+  const secondsToExhaust = exhaustAt - nowSeconds;
+
+  // Rendered as a SPAN, not a wall clock. Two reasons. It sits directly beside
+  // the reset span, and a bare "23:59" next to "1h57m" reads as a duration of
+  // 23 hours; and the clock form is restless -- with `used` fixed between host
+  // refreshes, exhaustAt drifts later at 100/used times real time (~1.4x at 71%
+  // used), so the digits move every render. The span it drifts by is
+  // elapsed * (100 - used) / used, which grows at only (100 - used)/used per
+  // minute -- 0.4 min/min at 71% used, and standing still at 50%. Same number,
+  // far less churn, and it answers "how long have I got" without the
+  // subtraction.
+  const eta = projected < 100 ? '' : fmtSpan(secondsToExhaust);
 
   // The exhaustion time is coloured by how much of the REMAINING window it
   // eats: under a third left is alarming, under two thirds is worth noticing.
-  const minutesToExhaust = (exhaustAt - nowSeconds) / 60;
+  const minutesToExhaust = secondsToExhaust / 60;
   const minutesToReset = (resets - nowSeconds) / 60;
   let timeColor = green;
   if (minutesToReset > 0) {
@@ -1859,12 +1946,18 @@ function paceArrow(usedPct, resetsAt, durationSeconds, nowSeconds) {
  * Seconds -> compact duration. The reference caps at hours, which produces
  * "142h" for a fresh 7-day window; days keep the 7d cell readable.
  * Non-positive (already elapsed, or a bogus stamp) renders as nothing at all.
+ *
+ * Hours carry their minutes ("1h57m", not "1h"). Flooring to the hour understated
+ * a 5h window's reset by up to 59 minutes, and it put the exhaustion span and the
+ * reset span on different resolutions -- "1h15m:1h" reads as though the limit is
+ * hit AFTER the window resets, which is exactly backwards.
  */
 function fmtSpan(seconds) {
   if (!(seconds > 0)) return '';
   const minutes = Math.floor(seconds / 60);
   if (minutes >= 2880) return `${Math.floor(minutes / 1440)}d`;   // 48h+
-  if (minutes > 99) return `${Math.floor(minutes / 60)}h`;
+  const hours = Math.floor(minutes / 60);
+  if (hours > 0) return `${hours}h${String(minutes % 60).padStart(2, '0')}m`;
   return `${minutes}m`;
 }
 
@@ -2585,9 +2678,10 @@ function lineCost(d, t, maxWidth) {
 }
 
 /**
- * One rate-limit cell: `5h 71%:60%↑ 16:20:1h`
- *                          |    |  |     |  `- time until the window resets
- *                          |    |  `- projected exhaustion clock
+ * One rate-limit cell: `5h 71%:60%↑ 1h15m:1h57m`
+ *                          |    |  |     |     `- time until the window resets
+ *                          |    |  `- time until the limit is projected to hit
+ *                          |    |     100%; absent when the window resets first
  *                          |    `- on_pace%: what a perfectly linear burn reads
  *                          `- used%
  *
@@ -2629,7 +2723,7 @@ function fiveHourColor(p) {
  * count that nobody needs.
  */
 /**
- * Spend against the configured allocation: "Bgt $34.63/250:6h".
+ * Spend against the configured allocation: "Bgt $34.63/250:6h20m".
  *
  * The trailing span is the same projection the rate-limit pace arrows make --
  * at the current burn, when does the allocation run out -- coloured by how much
@@ -3197,6 +3291,7 @@ function main() {
   maybeSelfUpdate();
   maybeRefreshUsage(data, ledger);
   maybeRefreshRtk(data);
+  sweepStateTemp();
 }
 
 // The flag strings are an INTERFACE, not an implementation detail: an already
