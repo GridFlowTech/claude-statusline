@@ -1888,6 +1888,35 @@ Output is one JSON line per row to override:
 task's `id` to keep its default rendering; emit an empty `content` to hide the
 row entirely.
 
+### Where a row's name comes from
+
+`tasks[].name` is filled from Claude Code's internal agent **name registry**,
+which only holds names that were explicitly allocated — teammates, FleetView
+rows. A plain `Agent({subagent_type: "data_dashboard_engineer"})` never
+registers one, so `name` arrives `undefined` and the only other identity in the
+payload is `type` — which is the task **kind** (`local_agent`, `local_bash`,
+`local_workflow`, `remote_agent`, `in_process_teammate`), not the agent type.
+Falling back to it puts a literal `local_agent` in the panel for every unnamed
+agent, which is the one thing the panel it sits in had already made obvious.
+
+The agent type does exist on disk. Claude Code writes a small sidecar beside
+each teammate's transcript:
+
+```
+<session>/subagents/agent-<id>.meta.json
+{"agentType":"data_dashboard_engineer","description":"Fix four dashboard defects",
+ "toolUseId":"toolu_017KV2…","spawnDepth":1}
+```
+
+So a row's name is resolved best-first: the registered `name`, then `agentType`
+from that sidecar, then a readable label for the kind (`agent`, `shell`,
+`workflow`, `teammate`, `remote agent`). The sidecar is read **only** for a row
+the payload did not name — one ~150-byte file, never the transcript itself —
+and the session directory is located from `transcript_path`, so nothing here
+assumes where Claude Code keeps projects. A missing, unreadable, or oversized
+`agentType` just falls through to the kind label, as does a task id that is not
+plain-filename-shaped.
+
 ### Why the model is read from the payload
 
 Existing implementations of this hook - including
@@ -1910,7 +1939,7 @@ The same trust and `disableAllHooks` gates that apply to `statusLine` apply to
 ## Development
 
 ```bash
-node test/run.js       # 87 assertions across all three scripts
+node test/run.js       # 148 assertions across all three scripts
 node --check statusline.js && node --check subagent-statusline.js && node --check install.js
 ```
 

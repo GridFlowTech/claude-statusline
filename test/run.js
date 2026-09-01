@@ -1402,6 +1402,113 @@ check('cells drop by rank: detail, age, model, then tokens before status on the 
   assertMatch(tie, 'completed', 'status (rank 2, leftmost) must win the tie');
 });
 
+/**
+ * A session directory as Claude Code lays it out: <dir>/<session>.jsonl beside
+ * <dir>/<session>/subagents/agent-<id>.meta.json. Returns the transcript path.
+ */
+function agentSidecar(metaById) {
+  const dir = sandbox();
+  const transcript = path.join(dir, 'sess.jsonl');
+  fs.writeFileSync(transcript, '');
+  const subagents = path.join(dir, 'sess', 'subagents');
+  fs.mkdirSync(subagents, { recursive: true });
+  for (const [id, meta] of Object.entries(metaById)) {
+    fs.writeFileSync(path.join(subagents, `agent-${id}.meta.json`), meta);
+  }
+  return transcript;
+}
+
+check('an unnamed agent takes its name from the sidecar, never the task kind', () => {
+  const transcript = agentSidecar({
+    a1: JSON.stringify({ agentType: 'data_dashboard_engineer', description: 'Fix four dashboard defects', spawnDepth: 1 }),
+  });
+  const r = run(SUB, {
+    columns: 90,
+    transcript_path: transcript,
+    tasks: [{ id: 'a1', type: 'local_agent', status: 'running', description: 'Fix four dashboard defects' }],
+  });
+  assertMatch(rowById(r, 'a1').content, 'data_dashboard_engineer', 'the agent type off disk');
+  assertNotMatch(rowById(r, 'a1').content, 'local_agent', 'the internal kind must never render');
+});
+
+check('a registered name wins over the sidecar', () => {
+  const transcript = agentSidecar({ a1: JSON.stringify({ agentType: 'data_dashboard_engineer' }) });
+  const r = run(SUB, {
+    columns: 90,
+    transcript_path: transcript,
+    tasks: [{ id: 'a1', name: 'dash', type: 'local_agent', status: 'running' }],
+  });
+  assertMatch(rowById(r, 'a1').content, 'dash', 'the payload name');
+  assertNotMatch(rowById(r, 'a1').content, 'data_dashboard_engineer', 'the sidecar must not override it');
+});
+
+check('main-session reads as main', () => {
+  const transcript = agentSidecar({ m: JSON.stringify({ agentType: 'main-session' }) });
+  const r = run(SUB, {
+    columns: 90,
+    transcript_path: transcript,
+    tasks: [{ id: 'm', type: 'local_agent', status: 'running' }],
+  });
+  assertMatch(rowById(r, 'm').content, 'main', 'the main session row');
+  assertNotMatch(rowById(r, 'm').content, 'main-session', 'the internal spelling');
+});
+
+check('task kinds fall back to readable labels, never to the raw identifier', () => {
+  const r = run(SUB, {
+    columns: 90,
+    tasks: [
+      { id: 'k1', type: 'local_agent', status: 'running' },
+      { id: 'k2', type: 'local_bash', status: 'running' },
+      { id: 'k3', type: 'local_workflow', status: 'running' },
+      { id: 'k4', type: 'in_process_teammate', status: 'running' },
+      { id: 'k5', type: 'remote_agent', status: 'running' },
+      { id: 'k6', type: 'local_notebook_thing', status: 'running' },
+    ],
+  });
+  assert(rowById(r, 'k1').content === 'agent', `local_agent -> ${rowById(r, 'k1').content}`);
+  assert(rowById(r, 'k2').content === 'shell', `local_bash -> ${rowById(r, 'k2').content}`);
+  assert(rowById(r, 'k3').content === 'workflow', `local_workflow -> ${rowById(r, 'k3').content}`);
+  assert(rowById(r, 'k4').content === 'teammate', `in_process_teammate -> ${rowById(r, 'k4').content}`);
+  assert(rowById(r, 'k5').content === 'remote agent', `remote_agent -> ${rowById(r, 'k5').content}`);
+  assert(rowById(r, 'k6').content === 'notebook thing', `an unknown kind -> ${rowById(r, 'k6').content}`);
+});
+
+check('a hostile sidecar cannot escape the session directory or the row', () => {
+  const esc = String.fromCharCode(27);
+  const transcript = agentSidecar({
+    ok: JSON.stringify({ agentType: `evil${esc}[31m` }),
+    long: JSON.stringify({ agentType: 'x'.repeat(200) }),
+    broken: '{not json',
+  });
+  const outside = path.join(path.dirname(transcript), 'sess', 'subagents', 'agent-esc.meta.json');
+  fs.writeFileSync(outside, JSON.stringify({ agentType: 'traversed' }));
+  const r = run(SUB, {
+    columns: 90,
+    transcript_path: transcript,
+    tasks: [
+      { id: 'ok', type: 'local_agent', status: 'running' },
+      { id: 'long', type: 'local_agent', status: 'running' },
+      { id: 'broken', type: 'local_agent', status: 'running' },
+      { id: '../subagents/agent-esc', type: 'local_agent', status: 'running' },
+      { id: 'missing', type: 'local_agent', status: 'running' },
+    ],
+  });
+  assert(!rowById(r, 'ok').content.includes(esc), 'ESC survived out of the sidecar');
+  assert(rowById(r, 'long').content === 'agent', 'an overlong agentType must be refused');
+  assert(rowById(r, 'broken').content === 'agent', 'unparseable JSON must fall back');
+  assert(rowById(r, '../subagents/agent-esc').content === 'agent', 'a path-shaped id must not be joined');
+  assert(rowById(r, 'missing').content === 'agent', 'a missing sidecar must fall back');
+});
+
+check('no transcript path means no sidecar lookup at all', () => {
+  const r = run(SUB, {
+    columns: 90,
+    session_id: 'sess',
+    tasks: [{ id: 'a1', type: 'local_agent', status: 'running' }],
+  });
+  assert(rowById(r, 'a1').content === 'agent', `expected the kind label, got ${rowById(r, 'a1').content}`);
+});
+
 check('SHOW_IDLE_ROWS=false hides idle rows by emitting empty content', () => {
   const src = fs.readFileSync(SUB, 'utf8');
   const tunable = 'const SHOW_IDLE_ROWS = true;';

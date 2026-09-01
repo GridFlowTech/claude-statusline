@@ -6,6 +6,20 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). The
 repository carries no version tags — the installer tracks `main` and self-updates
 from it — so sections are dated rather than numbered, newest first.
 
+## 2026-08-31
+
+### Fixed
+
+- Unnamed subagent rows rendered the literal string `local_agent`. The payload's
+  `tasks[].name` is only filled for agents in Claude Code's name registry
+  (teammates, FleetView rows); an `Agent({subagent_type: ...})` call registers
+  nothing, and the fallback was `tasks[].type` — which is the task *kind*, not
+  the agent type. Rows now resolve their name best-first: the registered name,
+  then `agentType` read from `<session>/subagents/agent-<id>.meta.json` (a
+  ~150-byte sidecar, read only for a row the payload did not name), then a
+  readable label for the kind (`agent`, `shell`, `workflow`, `teammate`,
+  `remote agent`). An internal kind identifier can no longer reach the panel.
+
 ## 2026-08-30
 
 ### Added

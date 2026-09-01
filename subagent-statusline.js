@@ -21,6 +21,19 @@
  *            to keep its default rendering; emit an empty content string to
  *            hide the row.
  *
+ * WHY A NAME SOMETIMES COMES OFF DISK
+ *   `tasks[].name` is filled from Claude Code's agent NAME REGISTRY, which only
+ *   holds names that were explicitly allocated (teammates, FleetView rows). A
+ *   plain `Agent({subagent_type: "data_dashboard_engineer"})` never registers
+ *   one, so `name` arrives undefined and the only other identity in the payload
+ *   is `type` -- the task KIND (`local_agent`, `local_bash`, `local_workflow`,
+ *   `remote_agent`, `in_process_teammate`), not the agent type. Rendering that
+ *   raw puts a literal `local_agent` in the panel for every unnamed agent.
+ *   The agent type does exist on disk, in a 142-byte sidecar next to the
+ *   teammate's transcript: <session>/subagents/agent-<id>.meta.json, holding
+ *   {"agentType", "description", "toolUseId", "spawnDepth"}. That file is read
+ *   ONLY for a row that has no name, and never for its transcript.
+ *
  * WHY THE MODEL IS READ FROM THE PAYLOAD
  *   Existing implementations of this hook open each teammate's own transcript
  *   at <session>/subagents/agent-<id>.jsonl to discover its model, because
@@ -37,6 +50,7 @@
  * ========================================================================== */
 
 const fs = require('fs');
+const path = require('path');
 
 /* ---------------------------------------------------------------------------
  * Tunables
@@ -241,6 +255,88 @@ function statusColor(status) {
 }
 
 /* ---------------------------------------------------------------------------
+ * Naming
+ * ------------------------------------------------------------------------ */
+
+/**
+ * `tasks[].type` is the task KIND, not an agent type. When it is all a row has,
+ * these are what a reader can actually use -- `local_agent` says nothing that
+ * the panel it sits in did not already say.
+ */
+const KIND_LABEL = {
+  local_agent: 'agent',
+  local_bash: 'shell',
+  local_shell: 'shell',
+  local_workflow: 'workflow',
+  remote_agent: 'remote agent',
+  in_process_teammate: 'teammate',
+};
+
+/** Task ids index a path, so they are whitelisted before being joined to one. */
+const SAFE_ID_RE = /^[A-Za-z0-9._-]{1,64}$/;
+
+/** Agent types are model- and config-authored: keep them short and printable. */
+const AGENT_TYPE_RE = /^[A-Za-z0-9 ._:@\/-]{1,48}$/;
+
+/**
+ * <session>/subagents/agent-<id>.meta.json -> its `agentType`, or ''.
+ *
+ * The session directory sits beside the session transcript and carries the same
+ * name minus the extension, so `transcript_path` locates it without assuming
+ * where Claude Code keeps projects. No transcript path, no lookup: `session_id`
+ * alone would only name a directory relative to the cwd, which is a different
+ * directory.
+ *
+ * The sidecar is keyed on the task id, which is the agent id Claude Code names
+ * the teammate's own transcript with. If that ever stops holding, the read
+ * misses and the row falls back to its kind label -- the same as for a teammate
+ * whose sidecar has not been written yet.
+ *
+ * One read of a ~150-byte file, only for a row the payload did not name, and
+ * only for a kind that has such a sidecar. Failure of any kind returns '' and
+ * the row falls back to its kind label.
+ */
+function agentTypeFromSidecar(id, ctx) {
+  if (!ctx || !SAFE_ID_RE.test(id)) return '';
+
+  const transcript = typeof ctx.transcriptPath === 'string' ? ctx.transcriptPath.trim() : '';
+  const sessionDir = transcript.replace(/\.jsonl$/i, '');
+  if (!sessionDir || sessionDir === transcript) return '';   // missing, or not a .jsonl path
+
+  try {
+    const file = path.join(sessionDir, 'subagents', `agent-${id}.meta.json`);
+    const meta = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const agentType = clean(meta?.agentType);
+    if (!agentType || !AGENT_TYPE_RE.test(agentType)) return '';
+    return agentType === 'main-session' ? 'main' : agentType;
+  } catch {
+    return '';   // no sidecar, unreadable, or not JSON -- all mean "no name"
+  }
+}
+
+/**
+ * The row's identity, best first: the registered name, then the agent type off
+ * disk, then a readable label for the kind. Never the raw kind string.
+ */
+function rowName(task, ctx) {
+  const registered = clean(task?.name);
+  if (registered) return registered;
+
+  const kind = clean(task?.type);
+  const known = Object.prototype.hasOwnProperty.call(KIND_LABEL, kind);
+
+  if (kind === 'local_agent' || kind === 'remote_agent' || !known) {
+    const agentType = agentTypeFromSidecar(clean(task?.id), ctx);
+    if (agentType) return agentType;
+  }
+
+  if (known) return KIND_LABEL[kind];
+  // A kind this file has not seen: make it readable rather than printing an
+  // internal identifier verbatim. `local_notebook` -> `notebook`.
+  return kind ? kind.replace(/^(?:local|remote|in_process)_/, '').replace(/_/g, ' ') : 'agent';
+}
+
+/* ---------------------------------------------------------------------------
  * Row rendering
  * ------------------------------------------------------------------------ */
 
@@ -275,14 +371,14 @@ function fit(cells, sep, maxWidth) {
  * Rank 0 never drops (the name), then status/model, then the description --
  * which is the longest and most expendable part.
  */
-function renderRow(task, columns, nowMs) {
+function renderRow(task, columns, nowMs, ctx) {
   const status = clean(task?.status).toLowerCase();
   const running = status === 'running';
 
   if (!running && !SHOW_IDLE_ROWS) return '';   // empty content hides the row
 
   const paintName = statusColor(status);
-  const name = clean(task?.name) || clean(task?.type) || 'agent';
+  const name = rowName(task, ctx);
 
   // model + effort read straight from the payload -- no transcript lookup.
   const model = friendlyModel(task?.model);
@@ -365,6 +461,9 @@ function main() {
   if (columns === null || columns < 10) columns = DEFAULT_COLUMNS;
 
   const nowMs = Date.now();
+  const ctx = {
+    transcriptPath: typeof data.transcript_path === 'string' ? data.transcript_path : '',
+  };
   const out = [];
 
   for (const task of tasks) {
@@ -372,7 +471,7 @@ function main() {
     if (typeof id !== 'string' || !id) continue;   // no id: leave the default row
     let content;
     try {
-      content = renderRow(task, columns, nowMs);
+      content = renderRow(task, columns, nowMs, ctx);
     } catch {
       continue;   // one bad task must not take out the other rows
     }
