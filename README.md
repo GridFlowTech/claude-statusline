@@ -26,7 +26,7 @@ statusline.js             the status line above the footer
 subagent-statusline.js    one row per subagent in the agent panel
 install.js                installer, updater and uninstaller in one file
 examples/                 mock payloads, plus a transcript that proves the dedup
-test/run.js               99 assertions, no framework
+test/run.js               148 assertions, no framework
 ```
 
 ---
